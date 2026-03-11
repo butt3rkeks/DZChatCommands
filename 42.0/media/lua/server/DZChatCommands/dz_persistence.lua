@@ -850,6 +850,54 @@ end
 --      offset by Config.LeaderSplitFlankDistance in 3 directions)
 --    - Migrating followers: blended migration target (replicating DZ's blend
 --      formula from applyMigrationDirective)
+-- Replicate DZ's getLeaderMigrationSettings (DZ_Leader.lua:1438).
+-- Used by installLeaderFix for pressure-initiated migrations.
+-- All referenced functions (GetMigrationSandboxSettings, IsMigrationEnabled)
+-- are exposed on the DynamicZ table.
+local function getLeaderMigrationSettings(dz)
+    local Config = DynamicZ_Config or {}
+
+    local sandbox
+    if DynamicZ.GetMigrationSandboxSettings then
+        sandbox = DynamicZ.GetMigrationSandboxSettings()
+    else
+        sandbox = {
+            enabled = DynamicZ.IsMigrationEnabled and DynamicZ.IsMigrationEnabled() or false,
+            radius = 2, percentage = 30, killThreshold = 5,
+            killWindowHours = 24, cooldownHours = 12, durationHours = 8, intensity = 2,
+        }
+    end
+
+    local intensity = math.floor(clamp(toNumber(sandbox.intensity, 2), 1, 3))
+    local profile
+    if intensity <= 1 then
+        profile = { checkIntervalMult = 1.25, percentageMult = 0.85, minScoreBias = 1.0, cooldownMult = 1.15 }
+    elseif intensity >= 3 then
+        profile = { checkIntervalMult = 0.75, percentageMult = 1.15, minScoreBias = -1.0, cooldownMult = 0.85 }
+    else
+        profile = { checkIntervalMult = 1.0, percentageMult = 1.0, minScoreBias = 0.0, cooldownMult = 1.0 }
+    end
+
+    local leaderStage = math.max(0, math.floor(toNumber(dz and dz.leaderStage, 0)))
+    local basePercentage = clamp(toNumber(sandbox.percentage, 30), 10, 40)
+    local stagePercentBonus = clamp(toNumber(Config.MigrationLeaderStagePercentBonus, 5), 0, 10)
+
+    local baseCooldown = clamp(toNumber(sandbox.cooldownHours, 12), 6, 24)
+    local cooldownReduction = clamp(toNumber(Config.MigrationLeaderStageCooldownReductionHours, 0.5), 0, 1)
+
+    return {
+        enabled = sandbox.enabled == true,
+        percentage = clamp((basePercentage + (leaderStage * stagePercentBonus)) * profile.percentageMult, 10, 40),
+        cooldownHours = math.max(toNumber(Config.MigrationMinCooldownHours, 4.0),
+            (baseCooldown - (leaderStage * cooldownReduction)) * profile.cooldownMult),
+        durationHours = clamp(toNumber(sandbox.durationHours, 8), 4, 12),
+        checkIntervalHours = math.max(0.5, toNumber(Config.MigrationCheckIntervalHours, 6.0) * profile.checkIntervalMult),
+        minimumScore = toNumber(Config.MigrationMinimumScore, 3.0) + profile.minScoreBias,
+        minWorldEvolution = clamp(toNumber(Config.MigrationMinWorldEvolution, 0.35), 0.0, 1.0),
+        minFollowers = math.max(1, math.floor(toNumber(Config.MigrationMinFollowers, 6))),
+    }
+end
+
 local function installLeaderFix()
     if not DynamicZ or not DynamicZ.ApplyLeaderInfluence then
         logInfo("WARN installLeaderFix: DynamicZ.ApplyLeaderInfluence not available.")
@@ -870,6 +918,7 @@ local function installLeaderFix()
 
         local Config = DynamicZ_Config or {}
         local nowH = getNowHours()
+        local Pressure = DZChatCommands_Pressure
 
         -- Resolve leader's target
         local leaderTarget = nil
@@ -903,6 +952,22 @@ local function installLeaderFix()
                 local mty = toNumber(dz.migrationTargetY, nil)
                 local mtz = math.floor(toNumber(dz.migrationTargetZ, leaderZ))
                 if mtx and mty then
+                    -- Pressure Case A: redirect to higher-pressure chunk if available
+                    if Pressure and Pressure.isInstalled and Pressure.isInstalled()
+                       and Pressure.findBestPressureTarget and Pressure.getMigrationScoreAtPos then
+                        local curScore = Pressure.getMigrationScoreAtPos(mtx, mty)
+                        local better = Pressure.findBestPressureTarget(leader, curScore)
+                        if better then
+                            mtx = better.x
+                            mty = better.y
+                            mtz = better.z
+                            dz.migrationTargetX = mtx
+                            dz.migrationTargetY = mty
+                            dz.migrationTargetZ = mtz
+                            dz.migrationTargetChunkKey = better.key
+                        end
+                    end
+
                     -- Replicate blend logic from applyMigrationDirective
                     local blendW = clamp(toNumber(Config.MigrationDirectionBlendWeight, 0.40), 0.0, 1.0)
                     local pathX, pathY = mtx, mty
@@ -917,6 +982,35 @@ local function installLeaderFix()
                         end
                     end
                     pathToLocation(leader, pathX, pathY, mtz)
+                end
+            end
+
+        end
+
+        -- Pressure Case B setup: if DZ did not start a migration, check whether
+        -- a pressure-driven migration should be initiated. Follower collection is
+        -- piggybacked onto the follower-path traversal below (single grid walk).
+        local pressureFollowers, pTarget, pSettings
+        if dz.isMigrating ~= true
+           and Pressure and Pressure.isInstalled and Pressure.isInstalled()
+           and Pressure.findBestPressureTarget then
+            local settings = getLeaderMigrationSettings(dz)
+            if settings.enabled == true then
+                local worldEvo = toNumber(DynamicZ.Global and DynamicZ.Global.worldEvolution, 0.0)
+                if worldEvo >= settings.minWorldEvolution
+                   and math.max(0, math.floor(toNumber(dz.leaderStage, 0))) >= 1
+                   and math.max(0, math.floor(toNumber(dz.lastFollowerCount, 0))) >= settings.minFollowers
+                   and toNumber(dz.migrationCooldownUntil, 0.0) <= nowH then
+                    local nextCheck = toNumber(dz._pressureMigCheckHour, 0.0)
+                    if nextCheck <= nowH then
+                        dz._pressureMigCheckHour = nowH + settings.checkIntervalHours
+                        local pt = Pressure.findBestPressureTarget(leader, settings.minimumScore)
+                        if pt then
+                            pTarget = pt
+                            pSettings = settings
+                            pressureFollowers = {}
+                        end
+                    end
                 end
             end
         end
@@ -945,6 +1039,18 @@ local function installLeaderFix()
                             for i = 0, movObjs:size() - 1 do
                                 local obj = movObjs:get(i)
                                 if obj and obj ~= leader and instanceof and instanceof(obj, "IsoZombie") then
+                                    -- Piggyback: collect non-leader zombies for pressure migration (Case B)
+                                    if pressureFollowers then
+                                        if not DynamicZ.CanProcessZombie or DynamicZ.CanProcessZombie(obj) then
+                                            local pDZ = DynamicZ.EnsureZombieData and DynamicZ.EnsureZombieData(obj)
+                                            if pDZ and pDZ.isLeader ~= true then
+                                                local fdx = toNumber(obj:getX(), 0) - cx
+                                                local fdy = toNumber(obj:getY(), 0) - cy
+                                                pressureFollowers[#pressureFollowers + 1] = { zombie = obj, dz = pDZ, distSq = fdx*fdx + fdy*fdy }
+                                            end
+                                        end
+                                    end
+
                                     local fMD = obj.getModData and obj:getModData()
                                     local fDZ = fMD and fMD.DZ
                                     if fDZ and fDZ.leaderInfluence == true
@@ -1017,6 +1123,50 @@ local function installLeaderFix()
                     end
                 end
             end
+        end
+
+        -- Pressure Case B: assign migration ModData if enough followers collected
+        if pressureFollowers and pTarget and pSettings
+           and #pressureFollowers >= pSettings.minFollowers then
+            table.sort(pressureFollowers, function(a, b) return toNumber(a.distSq, 0) > toNumber(b.distSq, 0) end)
+            local migrateCount = math.max(1, math.floor(#pressureFollowers * (pSettings.percentage / 100.0)))
+            migrateCount = math.min(migrateCount, #pressureFollowers)
+            local leaderId = DynamicZ.GetZombieDebugId and tostring(DynamicZ.GetZombieDebugId(leader)) or "unknown"
+            local migEndTime = nowH + pSettings.durationHours
+
+            dz.isMigrating = true
+            dz.migrationRole = "leader"
+            dz.migrationLeaderId = leaderId
+            dz.migrationTargetX = pTarget.x
+            dz.migrationTargetY = pTarget.y
+            dz.migrationTargetZ = pTarget.z
+            dz.migrationTargetChunkKey = pTarget.key
+            dz.migrationEndTime = migEndTime
+            dz.migrationStartFollowers = #pressureFollowers
+            dz.migrationAssignedCount = migrateCount
+            dz.migrationStartHour = nowH
+            dz.migrationLastFollowerCount = #pressureFollowers
+            dz.migrationLastDirectiveHour = nil
+
+            for mi = 1, migrateCount do
+                local sel = pressureFollowers[mi]
+                if sel and sel.dz then
+                    sel.dz.isMigrating = true
+                    sel.dz.migrationRole = "follower"
+                    sel.dz.migrationLeaderId = leaderId
+                    sel.dz.migrationTargetX = pTarget.x
+                    sel.dz.migrationTargetY = pTarget.y
+                    sel.dz.migrationTargetZ = pTarget.z
+                    sel.dz.migrationTargetChunkKey = pTarget.key
+                    sel.dz.migrationEndTime = migEndTime
+                    sel.dz.migrationLastDirectiveHour = nil
+                end
+            end
+
+            logInfo(string.format(
+                "Pressure migration started: target=%s score=%.2f pressure=%.3f followers=%d/%d",
+                tostring(pTarget.key), toNumber(pTarget.score, 0),
+                toNumber(pTarget.pressure, 0), migrateCount, #pressureFollowers))
         end
     end
 
@@ -1321,7 +1471,7 @@ local function installAllFixes()
     installTickFix()
     installDebugIdFix()
     installAdminDebugAccess()
-    -- Activity pressure system: must install AFTER leader fix (wraps ApplyLeaderInfluence upvalues)
+    -- Activity pressure system: installs evo + seed hooks. Migration is handled by installLeaderFix above.
     if DZChatCommands_Pressure and DZChatCommands_Pressure.install then
         DZChatCommands_Pressure.install()
     end

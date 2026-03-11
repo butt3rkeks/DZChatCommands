@@ -4,8 +4,9 @@
     Adds per-chunk "pressure" that builds over time when players remain in an
     area. Pressure influences three DZ systems:
 
-    1. Leader migration scoring: leaders prefer migrating toward high-pressure
-       chunks, drawing organized hordes toward entrenched players.
+    1. Leader migration: installLeaderFix in dz_persistence.lua calls this
+       module's query API to redirect or initiate migrations toward
+       high-pressure chunks, extending DZ's 30-50 tile range to 300 tiles.
     2. Evolution acceleration: zombies near high-pressure zones gain evoPoints
        faster, so the zombies that arrive get tougher quicker.
     3. Leader auto-seed rate: higher average pressure increases the desired
@@ -19,10 +20,6 @@
 
     Pressure data is persisted to file alongside the existing backup system
     and survives server restarts.
-
-    The migration hook uses debug.getupvalue/debug.setupvalue to extract and
-    replace the local evaluateMigrationTargetChunk function inside DZ's
-    ApplyLeaderInfluence closure chain.
 ]]
 
 -- =========================================================================
@@ -264,6 +261,12 @@ local function getPressureAtPos(worldX, worldY)
     return getPressure(cx, cy)
 end
 
+-- Get weighted migration pressure score at a world position.
+-- Returns MIGRATION_PRESSURE_WEIGHT * pressure (0..10).
+local function getMigrationScoreAtPos(worldX, worldY)
+    return MIGRATION_PRESSURE_WEIGHT * getPressureAtPos(worldX, worldY)
+end
+
 -- Get average pressure across all tracked chunks (for auto-seed scaling)
 local function getAveragePressure()
     local total = 0
@@ -299,171 +302,60 @@ local function getPressuredChunkCount()
 end
 
 -- =========================================================================
--- Hook 1: Migration scoring — inject pressure weight
+-- Migration target search (called by installLeaderFix in dz_persistence.lua)
 -- =========================================================================
 
--- Uses debug.getupvalue to extract local functions from DZ's closure chain.
---
--- IMPORTANT: By the time this installs, DynamicZ.ApplyLeaderInfluence has
--- already been replaced by the companion mod's leader fix wrapper. The chain is:
---
--- DynamicZ.ApplyLeaderInfluence  (wrapper from installLeaderFix)
---   -> upvalue: origApplyLeaderInfluence  (original DZ function)
---     -> upvalue: tryUpdateLeaderMigration  (local in DZ_Leader.lua)
---       -> upvalue: evaluateMigrationTargetChunk  (local in DZ_Leader.lua)
---
--- We must traverse TWO levels of upvalues to reach tryUpdateLeaderMigration.
+-- Find the best high-pressure chunk target for a leader.
+-- Scans all pressured chunks within an extended radius (up to 300 tiles at
+-- max pressure, interpolated from DZ's own radius at lower pressure).
+-- Returns { x, y, z, key, score, pressure } or nil.
+-- baseScore: minimum score to beat (use getMigrationScoreAtPos for current
+--   target in Case A, or settings.minimumScore for Case B).
+local function findBestPressureTarget(leader, baseScore)
+    if not leader or not leader.getX then return nil end
 
-local function installMigrationPressureHook()
-    if not DynamicZ or not DynamicZ.ApplyLeaderInfluence then
-        logPressure("WARN: ApplyLeaderInfluence not found, skipping migration hook.")
-        return false
-    end
+    local cs = getChunkSize()
+    local leaderCX = worldToChunk(leader:getX(), cs)
+    local leaderCY = worldToChunk(leader:getY(), cs)
+    local leaderZ = leader.getZ and math.floor(toNumber(leader:getZ(), 0)) or 0
 
-    -- Step 1: The current ApplyLeaderInfluence is the companion mod's wrapper.
-    -- Find the ORIGINAL DZ function stored as 'origApplyLeaderInfluence' upvalue.
-    local applyFn = DynamicZ.ApplyLeaderInfluence
-    local origApplyFn = nil
-    for i = 1, 60 do
-        local ok, name, val = pcall(debug.getupvalue, applyFn, i)
-        if not ok or name == nil then break end
-        if name == "origApplyLeaderInfluence" then
-            origApplyFn = val
-            break
-        end
-    end
+    local Config = DynamicZ_Config or {}
+    local dzRadius = math.max(1, math.floor(toNumber(Config.MigrationScanRadius, 2)))
+    local maxP = getMaxPressure()
+    local pressureRadius = math.floor(dzRadius + (MIGRATION_PRESSURE_MAX_SCAN_RADIUS - dzRadius) * maxP)
 
-    -- Fallback: if no wrapper exists (leader fix not installed), try direct
-    if not origApplyFn then
-        logPressure("No origApplyLeaderInfluence upvalue found, trying direct search.")
-        origApplyFn = applyFn
-    end
+    local bestScore = baseScore or 0
+    local best = nil
 
-    -- Step 2: Find tryUpdateLeaderMigration in the ORIGINAL function's upvalues
-    local tryUpdateIdx, tryUpdateFn = nil, nil
-    for i = 1, 60 do
-        local ok, name, val = pcall(debug.getupvalue, origApplyFn, i)
-        if not ok or name == nil then break end
-        if name == "tryUpdateLeaderMigration" then
-            tryUpdateIdx = i
-            tryUpdateFn = val
-            break
-        end
-    end
-
-    if not tryUpdateFn then
-        logPressure("WARN: Could not find tryUpdateLeaderMigration upvalue. Migration hook skipped.")
-        return false
-    end
-
-    -- Step 2: Find evaluateMigrationTargetChunk in tryUpdateLeaderMigration's upvalues
-    local evalIdx, evalFn = nil, nil
-    for i = 1, 60 do
-        local ok, name, val = pcall(debug.getupvalue, tryUpdateFn, i)
-        if not ok or name == nil then break end
-        if name == "evaluateMigrationTargetChunk" then
-            evalIdx = i
-            evalFn = val
-            break
-        end
-    end
-
-    if not evalFn then
-        logPressure("WARN: Could not find evaluateMigrationTargetChunk upvalue. Migration hook skipped.")
-        return false
-    end
-
-    -- Step 3: Also extract helper functions we need from evalFn's closure
-    -- We need: getChunkCoordsFromObject, isChunkLoaded, countActiveZombiesInChunk,
-    --          getChunkRecentKills, getChunkCenter, getChunkKey, getChunkSize, toNumber, clamp
-    -- But we already replicated the chunk helpers above. For the scoring, we
-    -- wrap the original and add our pressure term to its result.
-    --
-    -- Approach: call the original evalFn, then if it returned a result, add
-    -- pressure score. Also scan for higher-pressure chunks that the original
-    -- may have discarded (because they had too many zombies for the density check).
-    -- For simplicity and safety: wrap the original, boost its result, and also
-    -- check if any high-pressure chunk nearby would make a better target.
-
-    local function pressureAwareEvaluation(leader, settings, nowHours)
-        -- Call original scoring
-        local best = evalFn(leader, settings, nowHours)
-
-        -- Add pressure bonus to the original best result
-        if best and best.wx ~= nil and best.wy ~= nil then
-            local p = getPressure(best.wx, best.wy)
-            if p >= PRESSURE_MIN_THRESHOLD then
-                best.score = best.score + (MIGRATION_PRESSURE_WEIGHT * p)
-                best.pressure = p
-            end
-        end
-
-        -- Also scan for high-pressure targets well beyond DZ's small migration
-        -- radius (2-4 chunks / 20-40 tiles). The pressure scan uses an extended
-        -- radius that scales with the max pressure found: at low pressure we
-        -- stay close to DZ's radius, at full pressure we scan up to
-        -- MIGRATION_PRESSURE_MAX_SCAN_RADIUS chunks (300 tiles).
-        -- To keep the scan efficient at large radii, we only check chunks that
-        -- actually have pressure entries (sparse iteration) instead of scanning
-        -- every chunk in the radius.
-        if leader and leader.getX then
-            local cs = getChunkSize()
-            local leaderCX = worldToChunk(leader:getX(), cs)
-            local leaderCY = worldToChunk(leader:getY(), cs)
-            local leaderZ = leader.getZ and math.floor(toNumber(leader:getZ(), 0)) or 0
-            local dzRadius = math.max(1, math.floor(toNumber(settings.radius, 2)))
-            -- Scale scan radius with max pressure: lerp from DZ's radius to max
-            local maxP = getMaxPressure()
-            local pressureRadius = math.floor(dzRadius + (MIGRATION_PRESSURE_MAX_SCAN_RADIUS - dzRadius) * maxP)
-
-            for key, entry in pairs(chunkPressure) do
-                if entry.pressure >= PRESSURE_MIN_THRESHOLD then
-                    -- Parse chunk coords from key
-                    local kx, ky = key:match("^(-?%d+):(-?%d+)$")
-                    kx = tonumber(kx)
-                    ky = tonumber(ky)
-                    if kx and ky then
-                        local dist = math.abs(kx - leaderCX) + math.abs(ky - leaderCY)
-                        if dist > 0 and dist <= pressureRadius then
-                            -- Score purely from pressure (ignoring density gate)
-                            local p = entry.pressure
-                            local pressureScore = MIGRATION_PRESSURE_WEIGHT * p
-                            if pressureScore > (settings.minimumScore or 3.0) then
-                                if not best or pressureScore > best.score then
-                                    local tx, ty = getChunkCenter(kx, ky)
-                                    best = {
-                                        wx = kx, wy = ky,
-                                        x = tx, y = ty, z = leaderZ,
-                                        score = pressureScore,
-                                        recentKills = 0,
-                                        zombieCount = 0,
-                                        key = key,
-                                        pressure = p,
-                                    }
-                                end
-                            end
-                        end
+    for key, entry in pairs(chunkPressure) do
+        if entry.pressure >= PRESSURE_MIN_THRESHOLD then
+            local kx, ky = key:match("^(-?%d+):(-?%d+)$")
+            kx = tonumber(kx)
+            ky = tonumber(ky)
+            if kx and ky then
+                local dist = math.abs(kx - leaderCX) + math.abs(ky - leaderCY)
+                if dist > 0 and dist <= pressureRadius then
+                    local pScore = MIGRATION_PRESSURE_WEIGHT * entry.pressure
+                    if pScore > bestScore then
+                        bestScore = pScore
+                        local tx, ty = getChunkCenter(kx, ky)
+                        best = {
+                            x = tx, y = ty, z = leaderZ,
+                            key = getChunkKey(kx, ky),
+                            score = pScore,
+                            pressure = entry.pressure,
+                        }
                     end
                 end
             end
         end
-
-        return best
     end
 
-    -- Step 4: Inject our replacement via debug.setupvalue
-    local ok = pcall(debug.setupvalue, tryUpdateFn, evalIdx, pressureAwareEvaluation)
-    if not ok then
-        logPressure("WARN: debug.setupvalue failed for evaluateMigrationTargetChunk.")
-        return false
-    end
-
-    logPressure("Migration pressure hook installed (upvalue chain: ApplyLeaderInfluence -> tryUpdateLeaderMigration -> evaluateMigrationTargetChunk).")
-    return true
+    return best
 end
 
 -- =========================================================================
--- Hook 2: Evolution acceleration — bonus evoPoints in pressured zones
+-- Hook: Evolution acceleration — bonus evoPoints in pressured zones
 -- =========================================================================
 
 local function installEvoPressureHook()
@@ -517,7 +409,7 @@ local function installEvoPressureHook()
 end
 
 -- =========================================================================
--- Hook 3: Auto-seed scaling — more desired leaders under pressure
+-- Hook: Auto-seed scaling — more desired leaders under pressure
 -- =========================================================================
 
 local function installSeedPressureHook()
@@ -586,15 +478,14 @@ local function installPressureSystem()
         logPressure(string.format("Loaded %d pressured chunks from file.", count))
     end
 
-    -- Install hooks
-    local migOk = installMigrationPressureHook()
+    -- Install hooks (migration is handled by installLeaderFix in dz_persistence.lua)
     local evoOk = installEvoPressureHook()
     local seedOk = installSeedPressureHook()
 
     pressureInstalled = true
     logPressure(string.format(
-        "Pressure system installed: migration=%s evo=%s seed=%s",
-        tostring(migOk), tostring(evoOk), tostring(seedOk)
+        "Pressure system installed: evo=%s seed=%s",
+        tostring(evoOk), tostring(seedOk)
     ))
     return true
 end
@@ -690,9 +581,11 @@ DZChatCommands_Pressure = {
     handleCommand = handlePressureCommand,
     getPressure = getPressure,
     getPressureAtPos = getPressureAtPos,
+    getMigrationScoreAtPos = getMigrationScoreAtPos,
     getAveragePressure = getAveragePressure,
     getMaxPressure = getMaxPressure,
     getPressuredChunkCount = getPressuredChunkCount,
+    findBestPressureTarget = findBestPressureTarget,
     writePressureFile = writePressureFile,
     isInstalled = function() return pressureInstalled end,
 }
