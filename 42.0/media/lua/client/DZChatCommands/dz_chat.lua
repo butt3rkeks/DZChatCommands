@@ -147,20 +147,35 @@ local NET_MODULE = "DynamicZ"
 local NET_INFO = "DebugInfo"
 local NET_STATE = "DebugState"
 
+-- Track last-seen values to suppress duplicate messages
+local lastDebugEnabled = nil
+local lastInfoMessage = nil
+local lastInfoMs = 0
+local INFO_DEDUP_WINDOW_MS = 60000 -- suppress identical DebugInfo for 60s
+
 local function onServerCommand(module, command, args)
     if module ~= NET_MODULE then return end
     if not args then return end
 
     if command == NET_INFO and args.message then
-        showInfo(args.message)
+        -- Deduplicate: only show if message changed or 60s elapsed
+        local nowMs = getTimestampMs and getTimestampMs() or 0
+        if args.message ~= lastInfoMessage or (nowMs - lastInfoMs) >= INFO_DEDUP_WINDOW_MS then
+            showInfo(args.message)
+            lastInfoMessage = args.message
+            lastInfoMs = nowMs
+        end
     end
 
     if command == NET_STATE then
-        -- Show a summary when state arrives with no inspect data
-        -- (inspect data is handled by the DZ mod's own UI window)
+        -- Only show debug mode message when it actually changes
         if args.debugEnabled ~= nil then
-            local label = args.debugEnabled and "ENABLED" or "DISABLED"
-            showInfo("Debug mode: " .. label)
+            local enabled = args.debugEnabled == true
+            if lastDebugEnabled == nil or enabled ~= lastDebugEnabled then
+                local label = enabled and "ENABLED" or "DISABLED"
+                showInfo("Debug mode: " .. label)
+                lastDebugEnabled = enabled
+            end
         end
     end
 end

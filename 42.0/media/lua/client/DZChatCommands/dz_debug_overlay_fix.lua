@@ -1,21 +1,32 @@
 --[[
     DZChatCommands - Debug overlay fix for Dynamic Evolution Z
 
-    DZ_DebugClient.lua registers updateNearestZombieCache on the
-    "EveryOneSecond" event, but that event does NOT exist in PZ's
-    LuaEventManager (only EveryOneMinute and EveryTenMinutes exist).
-    The registration silently fails, so the debug overlay's nearest-
-    zombie readout never updates.
+    Fixes three issues that prevent the debug HUD overlay from appearing
+    on dedicated servers:
 
-    This fix re-registers the same function on the OnTick event,
-    throttled to once per ~1000 ms using getTimestampMs() (verified
-    global: LuaManager.java line 7709, wraps System.currentTimeMillis).
+    1. DZ_DebugClient.lua registers updateNearestZombieCache on the
+       "EveryOneSecond" event, but that event does NOT exist in PZ's
+       LuaEventManager (only EveryOneMinute and EveryTenMinutes exist).
+       The registration silently fails, so the overlay's nearest-zombie
+       readout never updates. Fix: re-register on OnTick, throttled to
+       ~1000 ms via getTimestampMs().
+
+    2. DZ_Config.lua sets DebugOverlay = false by default (line 148).
+       canShowOverlay() (DZ_DebugClient.lua:125) checks this BEFORE the
+       debug-enabled check, so the overlay never draws even after the
+       server enables debug mode. Fix: set DebugOverlay = true when the
+       player is admin (the admin + debugEnabled checks in canUseDebugUI
+       are sufficient gatekeeping).
+
+    3. DZ_DebugClient.lua's onGameStart (line 894) checks
+       isClientDebugEnabled() which returns false on join because the
+       server hasn't sent state yet. It bails without requesting initial
+       status, creating a chicken-and-egg: client never asks server,
+       server only sends on EveryOneMinute heartbeat. Fix: on first tick
+       when player is admin, send a status request to bootstrap the flow.
 
     API verification (all from LuaManager.GlobalObject, decompiled source):
       getTimestampMs()              -> line 7709, returns System.currentTimeMillis()
-      getPerformance()              -> line 3503, returns PerformanceSettings.instance
-      getPerformance():getFramerate() -> PerformanceSettings.java line 50, delegates to getLockFPS()
-      getAverageFPS()               -> line 9780, returns GameWindow.averageFPS (capped)
       OnTick event                  -> LuaEventManager.java line 590, fires from IngameState.onTick()
                                        with numberTicks as argument
 ]]
@@ -36,9 +47,26 @@ DynamicZ._debugOverlayFixLoaded = true
 local ClientState = DynamicZ.DebugClient
 local INTERVAL_MS = 1000
 local lastUpdateMs = 0
+local initialStatusSent = false
 
--- Reference the original function that DZ defines but never successfully hooks
--- We call it directly since it reads from DynamicZ.DebugClient state
+local function isPlayerAdmin(player)
+    if not player then return false end
+    if player.isAdmin and player:isAdmin() then return true end
+    if player.getAccessLevel then
+        local access = string.lower(tostring(player:getAccessLevel() or ""))
+        return access == "admin"
+    end
+    return false
+end
+
+-- Fix 2: Override DebugOverlay config so canShowOverlay() / drawOverlay() are
+-- not blocked. The admin + debugEnabled checks in canUseDebugUI() are sufficient.
+-- We set this unconditionally; canShowOverlay still requires debug enabled + admin.
+if DynamicZ_Config then
+    DynamicZ_Config.DebugOverlay = true
+    print("[DZChatCommands] Debug overlay fix: set DynamicZ_Config.DebugOverlay = true")
+end
+
 local function tickUpdateNearestZombieCache()
     local nowMs = getTimestampMs()
     if (nowMs - lastUpdateMs) < INTERVAL_MS then
@@ -46,23 +74,11 @@ local function tickUpdateNearestZombieCache()
     end
     lastUpdateMs = nowMs
 
-    -- Guard: DZ may not have finished loading its functions yet
     if not DynamicZ or not DynamicZ.DebugClient then
         return
     end
 
-    -- Reproduce the exact logic from DZ_DebugClient.lua lines 704-729
-    -- We cannot call the local function directly (it's local to that file),
-    -- so we inline the equivalent logic using the same DynamicZ APIs.
-
-    -- Check canShowOverlay equivalent
-    if DynamicZ_Config and DynamicZ_Config.DebugOverlay == false then
-        ClientState.targetStage = nil
-        ClientState.targetDistance = nil
-        return
-    end
-
-    -- Check debug enabled
+    -- Check debug enabled (same cascade as DZ_DebugClient.lua isClientDebugEnabled)
     local debugEnabled = false
     if DynamicZ.DebugEnabled ~= nil then
         debugEnabled = DynamicZ.DebugEnabled == true
@@ -74,12 +90,6 @@ local function tickUpdateNearestZombieCache()
         debugEnabled = true
     end
 
-    if not debugEnabled then
-        ClientState.targetStage = nil
-        ClientState.targetDistance = nil
-        return
-    end
-
     -- Check player exists and is admin (for MP)
     local player = getPlayer and getPlayer() or nil
     if not player then
@@ -88,19 +98,31 @@ local function tickUpdateNearestZombieCache()
         return
     end
 
+    local playerIsAdmin = true
     if isClient and isClient() then
-        local isAdmin = false
-        if player.isAdmin and player:isAdmin() then
-            isAdmin = true
-        elseif player.getAccessLevel then
-            local access = string.lower(tostring(player:getAccessLevel() or ""))
-            isAdmin = (access == "admin")
-        end
-        if not isAdmin then
+        playerIsAdmin = isPlayerAdmin(player)
+        if not playerIsAdmin then
             ClientState.targetStage = nil
             ClientState.targetDistance = nil
             return
         end
+    end
+
+    -- Fix 3: On first tick when player is admin, request status from server
+    -- to bootstrap the debug state flow. DZ's onGameStart bails because
+    -- isClientDebugEnabled() is false before the server sends state.
+    if not initialStatusSent and playerIsAdmin then
+        initialStatusSent = true
+        if sendClientCommand then
+            sendClientCommand("DynamicZ", "Debug", { action = "status" })
+            print("[DZChatCommands] Debug overlay fix: sent initial status request to server")
+        end
+    end
+
+    if not debugEnabled then
+        ClientState.targetStage = nil
+        ClientState.targetDistance = nil
+        return
     end
 
     -- getNearestZombieStageInfo equivalent
@@ -193,7 +215,6 @@ local function tickUpdateNearestZombieCache()
             snapshot.maxLeaders = math.floor(tonumber(DynamicZ.GetMaxLeaders()) or 1)
         end
 
-        -- Merge: keep existing state keys, overlay snapshot defaults
         local merged = snapshot
         if ClientState.state then
             for key, value in pairs(ClientState.state) do
@@ -215,7 +236,6 @@ local function tickUpdateNearestZombieCache()
     local refreshIntervalHours = 3.0 / 3600.0
     local nextRefresh = tonumber(ClientState.nextStatusRefreshHour) or 0
     if nowHours >= nextRefresh then
-        -- Request updated state from server
         if sendClientCommand then
             sendClientCommand("DynamicZ", "Debug", { action = "status" })
         elseif DynamicZ.ExecuteDebugAction then

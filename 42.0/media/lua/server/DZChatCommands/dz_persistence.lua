@@ -143,8 +143,21 @@ local function toNumber(value, fallback)
     return n ~= nil and n or fallback
 end
 
+-- Deduplicating logger: suppresses identical messages within a 60s window.
+-- Changed or new messages print immediately. Same message re-prints after 60s.
+local _logLastMessage = nil
+local _logLastMs = 0
+local _LOG_DEDUP_MS = 60000
+
 local function logInfo(message)
-    print(LOG_TAG .. " " .. tostring(message))
+    local msg = tostring(message)
+    local nowMs = getTimestampMs and getTimestampMs() or 0
+    if msg == _logLastMessage and (nowMs - _logLastMs) < _LOG_DEDUP_MS then
+        return
+    end
+    _logLastMessage = msg
+    _logLastMs = nowMs
+    print(LOG_TAG .. " " .. msg)
 end
 
 local function clamp(value, minValue, maxValue)
