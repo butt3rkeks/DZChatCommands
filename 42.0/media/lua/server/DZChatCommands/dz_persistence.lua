@@ -592,6 +592,14 @@ local function installSaveHook()
     DynamicZ.SaveGlobalState = function()
         original()
         writeBackup()
+        -- Also persist pressure data so it survives graceful shutdown.
+        -- Guard with isInstalled() to avoid overwriting a valid pressure file
+        -- with empty data if the pressure system failed to install.
+        if DZChatCommands_Pressure and DZChatCommands_Pressure.isInstalled
+                and DZChatCommands_Pressure.isInstalled()
+                and DZChatCommands_Pressure.writePressureFile then
+            DZChatCommands_Pressure.writePressureFile()
+        end
     end
     DynamicZ._DZChatCmds_SaveHooked = true
     logInfo("SaveGlobalState hook installed.")
@@ -1313,6 +1321,10 @@ local function installAllFixes()
     installTickFix()
     installDebugIdFix()
     installAdminDebugAccess()
+    -- Activity pressure system: must install AFTER leader fix (wraps ApplyLeaderInfluence upvalues)
+    if DZChatCommands_Pressure and DZChatCommands_Pressure.install then
+        DZChatCommands_Pressure.install()
+    end
 end
 
 -- Lazy-init: run fixup on first client command if events never fired
@@ -1386,6 +1398,11 @@ local function onClientCommand(module, command, player, args)
             logInfo("ForceSave: writeBackup returned false.")
         end
 
+        -- Also persist pressure data
+        if DZChatCommands_Pressure and DZChatCommands_Pressure.writePressureFile then
+            DZChatCommands_Pressure.writePressureFile()
+        end
+
         -- Send confirmation back
         if sendServerCommand then
             local g = DynamicZ and DynamicZ.Global or {}
@@ -1401,6 +1418,35 @@ local function onClientCommand(module, command, player, args)
             end)
         else
             logInfo("WARN ForceSave: sendServerCommand not available.")
+        end
+
+    elseif command == "Pressure" then
+        logInfo("Pressure command received.")
+        if not player then return end
+        local isAdmin = false
+        if player.getAccessLevel then
+            local access = string.lower(tostring(player:getAccessLevel() or ""))
+            isAdmin = (access == "admin") or (access == "moderator")
+                   or (access == "overseer") or (access == "gm")
+        end
+        if not isAdmin then
+            if sendServerCommand then
+                pcall(function()
+                    sendServerCommand(player, "DynamicZ", "DebugInfo",
+                        { message = "Pressure denied: insufficient access." })
+                end)
+            end
+            return
+        end
+        if DZChatCommands_Pressure and DZChatCommands_Pressure.handleCommand then
+            DZChatCommands_Pressure.handleCommand(player)
+        else
+            if sendServerCommand then
+                pcall(function()
+                    sendServerCommand(player, "DynamicZ", "DebugInfo",
+                        { message = "Pressure system not loaded." })
+                end)
+            end
         end
 
     elseif command == "Diagnostics" then
@@ -1485,6 +1531,16 @@ local function onClientCommand(module, command, player, args)
             lines[#lines + 1] = "Backup file: not found"
         end
 
+        -- Activity pressure
+        if DZChatCommands_Pressure and DZChatCommands_Pressure.isInstalled and DZChatCommands_Pressure.isInstalled() then
+            lines[#lines + 1] = string.format("Pressure: max=%.3f avg=%.3f chunks=%d",
+                DZChatCommands_Pressure.getMaxPressure(),
+                DZChatCommands_Pressure.getAveragePressure(),
+                DZChatCommands_Pressure.getPressuredChunkCount())
+        else
+            lines[#lines + 1] = "Pressure: not installed"
+        end
+
         -- Per-player kill baselines
         local baselineCount = 0
         for _ in pairs(playerKillBaselines) do baselineCount = baselineCount + 1 end
@@ -1560,6 +1616,10 @@ if not DynamicZ_ChatCmds_ServerLoaded then
         end
         if DynamicZ.RecountActiveLeaders then
             DynamicZ.RecountActiveLeaders(false)
+        end
+        -- Activity pressure tick: accumulate/decay per-chunk pressure
+        if DZChatCommands_Pressure and DZChatCommands_Pressure.tick then
+            DZChatCommands_Pressure.tick()
         end
     end)
 
