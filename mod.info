@@ -1,5 +1,5 @@
-name=DZ Chat Commands
+name=Dynamic Evolution Z - MP Fixes
 id=DZChatCommands
-description=Chat commands for Dynamic Evolution Z debug tools. Type /dz help in chat.
+description=Fixes dedicated server bugs in Dynamic Evolution Z and adds admin chat commands. Type /dz help in chat.
 poster=poster.png
 icon=

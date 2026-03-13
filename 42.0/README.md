@@ -1,6 +1,6 @@
-# DZ Chat Commands
+# Dynamic Evolution Z - MP Fixes
 
-Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes 15 bugs that break DZ on dedicated servers and adds admin chat commands for managing the evolution system.
+Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes 15 bugs that break DZ on dedicated servers, adds an activity pressure system, and provides admin chat commands for managing the evolution system.
 
 Does not modify any DZ files. All fixes are applied at runtime via function wrapping. Safe to add or remove at any time.
 
@@ -26,6 +26,7 @@ Type `/dz help` in-game chat. All commands require admin access.
 | `/dz forcepulse` | Force all leaders to pulse immediately |
 | `/dz reset` | Reset all DZ state |
 | `/dz forcesave` | Force backup write to file |
+| `/dz pressure` | Show activity pressure heat map |
 | `/dz diag` | Show server diagnostics (fix status, state values, backup info) |
 
 ## Server-Side Fixes (dz_persistence.lua)
@@ -83,6 +84,36 @@ DZ registers `DebugTrackTick` on `EveryOneSecond` (`DZ_Debug.lua:1501`). The ser
 ### Admin debug access
 DZ's debug system requires the sandbox `EnableDebugMode` setting. Fix: sets `DynamicZ.DebugEnabled = true` server-side at startup, which propagates to clients via `buildStatePayload`. The existing admin check in `canUseDebugUI` ensures only admins see the overlay and can use debug commands.
 
+## Activity Pressure System (dz_pressure.lua)
+
+Adds per-chunk "pressure" that builds when players remain in an area. Pressure influences three DZ systems: leader migration targeting, evolution speed, and leader auto-seed rate.
+
+### How pressure accumulates
+
+Pressure is tracked per chunk using DZ's own chunk coordinate system (`Config.MigrationChunkSize`, default 10 tiles). Every game-minute, each online player's chunk plus its immediate Manhattan-distance neighbors gain pressure at a rate of `1/720` per minute (~12 game-hours to reach max 1.0). Chunks without a player present decay at `1/1440` per minute (~24 game-hours from full to zero). Chunks below 0.001 are purged to save memory. Data is persisted to `DZChatCommands_Pressure.ini` every 10 game-minutes.
+
+### Migration influence
+
+Integrated into the `installLeaderFix` wrapper in dz_persistence.lua. Two cases:
+
+- **Case A (redirect)**: When DZ starts a migration on its own, the wrapper calls `findBestPressureTarget(leader, currentScore)` to check if any high-pressure chunk scores higher than DZ's chosen target. If so, the migration target is overridden. This uses an extended scan radius: at max pressure, leaders can be attracted from up to 30 chunks (300 tiles) away, linearly interpolated from DZ's own 2-4 chunk radius at lower pressure.
+
+- **Case B (initiate)**: When DZ's `evaluateMigrationTargetChunk` returns nil (no chunk passes its density/kill gates), the wrapper checks pressure-only targets. If a high-pressure chunk exists and DZ's preconditions are met (migration enabled, sufficient worldEvolution, leaderStage >= 1, enough followers, cooldown expired), the wrapper starts the migration itself by setting the same ModData fields that DZ's `startLeaderMigration` uses. Follower collection piggybacks on the existing grid traversal to avoid duplicate iteration.
+
+Pressure score formula: `MIGRATION_PRESSURE_WEIGHT * pressure` (0 to 10 at max). This competes directly with DZ's `killWeight * recentKills + densityWeight * headroom` (typically 5-15 range).
+
+### Evolution acceleration
+
+Wraps `DynamicZ.TryAddEvolutionPoints`. After the original adds its base 1.0 point, adds a pressure bonus: `pressure * EVO_PRESSURE_MULTIPLIER` (default 1.0, so at max pressure zombies gain evo points at 2x rate). Uses a fractional accumulator (`_pressureEvoRemainder`) identical to DZ's `evoPointRemainder` pattern. Only applies when DZ's own guards pass (evolution enabled, `CanProcessZombie`, active chunk, target within 10 tiles).
+
+### Leader auto-seed scaling
+
+Wraps `DynamicZ.TryAutoSeedLeaders`. Temporarily inflates `DynamicZ_Config.LeaderAutoSeedMinPercent` based on average pressure across all tracked chunks. At max average pressure, the desired leader count is multiplied by `SEED_PRESSURE_MAX_MULTIPLIER` (default 5x). Original value is always restored after the call, even on error.
+
+### Chat command
+
+`/dz pressure` shows the pressure heat map: tracked chunk count, max/avg pressure, top 10 highest-pressure chunks, and current effect strengths (evo bonus, migration weight, seed multiplier).
+
 ## Client-Side Fixes
 
 ### Debug overlay (dz_debug_overlay_fix.lua)
@@ -112,6 +143,7 @@ Server responses (`DebugInfo` and `DebugState`) are displayed in chat with dedup
   media/lua/
     server/DZChatCommands/
       dz_persistence.lua     # All 15 server-side fixes + ForceSave/Diagnostics commands
+      dz_pressure.lua        # Activity pressure system (heat map, migration/evo/seed hooks)
     client/DZChatCommands/
       dz_chat.lua            # Chat command bridge (/dz <subcommand>)
       dz_debug_overlay_fix.lua  # Debug HUD overlay fixes

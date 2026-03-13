@@ -90,16 +90,15 @@
        This also improves getZombieRuntimeId's fallback chain (line 188
        calls getZombieDebugId as its last resort).
    16. DZ's SyncVanillaKillCounter uses a single global vanillaKillBaseline
-       that resets when the online player pool changes. When a player
-       disconnects, baseline drops. When they reconnect, their lifetime
-       getZombieKills() re-appears as a delta and gets added to totalKills
-       again. Every reconnect inflates the kill counter by the player's
-       full lifetime kills. Fixed by replacing SyncVanillaKillCounter with
-       a per-player baseline system: each player's getZombieKills() is
-       recorded on first observation (persisted to file across restarts).
-       Only kills above that baseline are counted as new. Mid-game install
-       is safe: pre-existing kills are captured as baseline and not
-       double-counted.
+       that resets on server restart (set to 0 at OnGameStart when no players
+       are connected yet). On dedicated server, EveryOneSecond is dead so the
+       sync never runs again — totalKills only grows from OnZombieDead events
+       and resets to 0 on every restart (ModData persistence bug). Fixed by
+       replacing SyncVanillaKillCounter with a vanilla-truth sync: tracks
+       each player's getZombieKills() (persisted to file for offline players),
+       sets totalKills = max(totalKills, sum of all player kills). The vanilla
+       counter is PZ's own persistent source of truth — survives restarts
+       without any backup needed.
 
     Unfixable from companion mod (require upstream changes):
     - zombie:getMemory()/setMemory() don't exist. memory is a public int
@@ -122,24 +121,24 @@
     - Wraps ApplyStageEvolutionBuffs (fixes 8, 9), TryAmbientWander (fix 10),
       and ApplyLeaderInfluence (fix 11) to replace dead setLastHeardSound
       calls with pathToLocationF.
-    - Replaces SyncVanillaKillCounter with per-player baseline tracking
-      (fix 16) to prevent kill count inflation on reconnect.
+    - Replaces SyncVanillaKillCounter with vanilla-truth sync (fix 16):
+      uses each player's getZombieKills() as persistent source of truth.
     - Provides "ForceSave" and "Diagnostics" network commands.
 ]]
 
 local BACKUP_FILE = "DZChatCommands_GlobalState.ini"
-local PLAYER_BASELINES_FILE = "DZChatCommands_PlayerKillBaselines.ini"
+local PLAYER_KILLS_FILE = "DZChatCommands_PlayerKills.ini"
 local NET_MODULE = "DZChatCmds"
 local LOG_TAG = "[DZChatCommands]"
 
 local fixupComplete = false
 
--- Per-player kill baselines: keyed by username, value = getZombieKills() at
--- first observation. Prevents reconnecting players from inflating totalKills.
--- DZ's original SyncVanillaKillCounter uses a single global baseline that
--- resets on disconnect, causing the full lifetime kill count to be re-added
--- each time a player reconnects.
-local playerKillBaselines = {}
+-- Per-player last-known kills: keyed by username, value = getZombieKills().
+-- Updated every sync for connected players, persisted to file for offline
+-- players. totalKills = max(totalKills, sum of all entries). The vanilla
+-- kill counter is the source of truth — it persists across restarts in PZ's
+-- own save data, so we never lose kill history.
+local playerKills = {}
 
 -- Polyfill: getNumActiveZombies() does not exist in Build 42.
 -- DZ_Leader.lua calls it for auto-seeding and max leader calculation.
@@ -162,6 +161,37 @@ end
 local function toNumber(value, fallback)
     local n = tonumber(value)
     return n ~= nil and n or fallback
+end
+
+-- Iterate all active players. Matches DZ's forEachActivePlayer pattern:
+-- tries getOnlinePlayers() first, falls back to getNumActivePlayers() +
+-- getSpecificPlayer(i) for singleplayer where getOnlinePlayers() returns
+-- an empty list.
+local function forEachActivePlayer(callback)
+    if not callback then return end
+
+    if getOnlinePlayers then
+        local players = getOnlinePlayers()
+        if players and players.size and players.get and players:size() > 0 then
+            for i = 0, players:size() - 1 do
+                local player = players:get(i)
+                if player then
+                    callback(player)
+                end
+            end
+            return
+        end
+    end
+
+    -- Singleplayer fallback: getOnlinePlayers() returns empty list
+    if not getNumActivePlayers or not getSpecificPlayer then return end
+    local count = math.max(0, math.floor(toNumber(getNumActivePlayers(), 0)))
+    for i = 0, count - 1 do
+        local player = getSpecificPlayer(i)
+        if player then
+            callback(player)
+        end
+    end
 end
 
 -- Deduplicating logger: suppresses identical messages within a 60s window.
@@ -459,25 +489,23 @@ local function readBackup()
     return data
 end
 
--- Write per-player kill baselines to file.
--- Format: one line per player "username=baselineKills"
-local function writePlayerBaselines()
-    local ok, writer = pcall(getFileWriter, PLAYER_BASELINES_FILE, true, false)
+-- Write per-player last-known kills to file.
+-- Format: one line per player "username=kills"
+local function writePlayerKills()
+    local ok, writer = pcall(getFileWriter, PLAYER_KILLS_FILE, true, false)
     if not ok or not writer then return false end
 
-    local count = 0
-    for username, baseline in pairs(playerKillBaselines) do
-        writer:write(tostring(username) .. "=" .. tostring(math.floor(baseline)) .. "\n")
-        count = count + 1
+    for username, kills in pairs(playerKills) do
+        writer:write(tostring(username) .. "=" .. tostring(math.floor(kills)) .. "\n")
     end
     writer:close()
     return true
 end
 
--- Read per-player kill baselines from file.
--- Returns table keyed by username -> baseline kill count.
-local function readPlayerBaselines()
-    local ok, reader = pcall(getFileReader, PLAYER_BASELINES_FILE, false)
+-- Read per-player last-known kills from file.
+-- Returns table keyed by username -> kill count.
+local function readPlayerKills()
+    local ok, reader = pcall(getFileReader, PLAYER_KILLS_FILE, false)
     if not ok or not reader then return {} end
 
     local data = {}
@@ -493,87 +521,60 @@ local function readPlayerBaselines()
     return data
 end
 
--- Per-player vanilla kill sync. Replaces DZ's broken SyncVanillaKillCounter.
+-- Vanilla kill sync. Replaces DZ's broken SyncVanillaKillCounter.
 --
--- DZ's original uses a single global vanillaKillBaseline that resets when
--- players disconnect (the pool shrinks) and spikes when they reconnect
--- (their lifetime getZombieKills() re-appears), causing the delta logic
--- to re-add their entire kill history to totalKills.
+-- Uses each player's getZombieKills() as the source of truth. The vanilla
+-- counter persists in PZ's own save data and never loses kills, unlike
+-- DZ's ModData-based totalKills which resets on dedicated server restart.
 --
--- This replacement tracks per-player baselines: the first time we see a
--- player (by username), we record their getZombieKills() as their baseline.
--- Only kills ABOVE that baseline are counted as new. On reconnect, the
--- player's baseline is loaded from the persisted file, so their pre-existing
--- kills are never re-counted.
---
--- Mid-game install: baselines file won't exist yet. First observation of
--- each player records their current kills. Any kills they had before the
--- mod was installed are treated as pre-existing (baseline), which is correct
--- because those kills were never counted by this mod's event path either.
--- DZ's own OnZombieDead event path counts kills going forward from the
--- moment it starts running. The sync only catches kills that the event
--- path might miss (e.g., vehicle kills).
-local function syncVanillaKillsPerPlayer()
+-- Tracks last-known kills per player (persisted to file for offline players).
+-- On each sync: update connected players, sum all entries (online + offline),
+-- set totalKills = max(totalKills, sum). OnZombieDead can push totalKills
+-- higher (non-player kills like fire/vehicles), which is preserved by the
+-- max() — vanilla kills are a floor, not a ceiling.
+local function syncVanillaKills()
     if not DynamicZ or not DynamicZ.Global then return end
-    if not getOnlinePlayers then return end
 
-    local players = getOnlinePlayers()
-    if not players or not players.size or not players.get then return end
+    local changed = false
 
-    local totalNewKills = 0
-    local baselinesChanged = false
+    forEachActivePlayer(function(player)
+        if not player.getZombieKills or not player.getUsername then return end
+        local username = tostring(player:getUsername())
+        local currentKills = math.max(0, math.floor(toNumber(player:getZombieKills(), 0)))
 
-    for i = 0, players:size() - 1 do
-        local player = players:get(i)
-        if player and player.getZombieKills and player.getUsername then
-            local username = tostring(player:getUsername())
-            local currentKills = math.max(0, math.floor(toNumber(player:getZombieKills(), 0)))
+        local prev = playerKills[username]
+        if prev == nil or currentKills > math.floor(prev) then
+            playerKills[username] = currentKills
+            changed = true
+        end
+    end)
 
-            local baseline = playerKillBaselines[username]
-            if baseline == nil then
-                -- First time seeing this player: record baseline, don't count
-                playerKillBaselines[username] = currentKills
-                baselinesChanged = true
-                logInfo(string.format("Kill baseline for %s: %d", username, currentKills))
-            else
-                local delta = currentKills - math.floor(baseline)
-                if delta > 0 then
-                    totalNewKills = totalNewKills + delta
-                    -- Update baseline to current so we don't re-count
-                    playerKillBaselines[username] = currentKills
-                    baselinesChanged = true
-                end
-            end
+    if changed then
+        writePlayerKills()
+    end
+
+    -- Sum all known player kills (online + offline from file)
+    local vanillaSum = 0
+    for _, kills in pairs(playerKills) do
+        vanillaSum = vanillaSum + math.floor(kills)
+    end
+
+    -- totalKills = max(current, vanilla sum). OnZombieDead may have pushed
+    -- totalKills above the vanilla sum (non-player kills), so never decrease.
+    local currentTotal = math.floor(toNumber(DynamicZ.Global.totalKills, 0))
+    if vanillaSum > currentTotal then
+        DynamicZ.Global.totalKills = vanillaSum
+        logInfo(string.format("Kill sync: totalKills %d -> %d (vanilla sum)", currentTotal, vanillaSum))
+        if DynamicZ.RecalculateWorldEvolution then
+            DynamicZ.RecalculateWorldEvolution()
+        elseif DynamicZ.SaveGlobalState then
+            DynamicZ.SaveGlobalState()
         end
     end
 
-    if baselinesChanged then
-        writePlayerBaselines()
-    end
-
-    -- Subtract kills already counted by the OnZombieDead event path
-    -- to avoid double-counting (same logic as original SyncVanillaKillCounter)
-    if totalNewKills > 0 then
-        local runtime = DynamicZ.Runtime or {}
-        DynamicZ.Runtime = runtime
-        local eventAdds = math.max(0, math.floor(toNumber(runtime.killAddsFromEvents, 0)))
-        local missing = totalNewKills - eventAdds
-        if missing > 0 then
-            DynamicZ.Global.totalKills = math.floor(toNumber(DynamicZ.Global.totalKills, 0)) + missing
-            logInfo(string.format("Vanilla kill sync: +%d missing kills (vanilla delta=%d, events=%d)",
-                missing, totalNewKills, eventAdds))
-            if DynamicZ.RecalculateWorldEvolution then
-                DynamicZ.RecalculateWorldEvolution()
-            elseif DynamicZ.SaveGlobalState then
-                DynamicZ.SaveGlobalState()
-            end
-        end
-        runtime.killAddsFromEvents = 0
-    else
-        -- Reset event counter even if no vanilla delta, to stay in sync
-        if DynamicZ.Runtime then
-            DynamicZ.Runtime.killAddsFromEvents = 0
-        end
+    -- Reset killAddsFromEvents so DZ's own bookkeeping stays clean
+    if DynamicZ.Runtime then
+        DynamicZ.Runtime.killAddsFromEvents = 0
     end
 end
 
@@ -1359,21 +1360,10 @@ local function onGameStartFixup()
     local days = getWorldAgeDays()
     logInfo(string.format("World age (corrected): %.1f days", days))
 
-    -- If DZ loaded all zeros, try restoring kills from our backup
-    if loadedKills == 0 then
-        local backup = readBackup()
-        if backup then
-            local backupKills = math.floor(toNumber(backup.totalKills, 0))
-            logInfo(string.format("Backup state: totalKills=%d", backupKills))
-
-            if backupKills > 0 then
-                g.totalKills = backupKills
-                logInfo(string.format("Restored totalKills=%d from backup.", backupKills))
-            end
-        else
-            logInfo("No backup file found (first run).")
-        end
-    end
+    -- Sync totalKills from vanilla kill counters (the source of truth).
+    -- This handles both fresh starts and restarts where ModData was lost.
+    syncVanillaKills()
+    logInfo(string.format("After vanilla sync: totalKills=%d", math.floor(toNumber(g.totalKills, 0))))
 
     -- DZ's RecalculateWorldEvolution has a bug: it calls
     -- gameTime:getWorldAgeDays() which doesn't exist on GameTime
@@ -1409,28 +1399,28 @@ local function onGameStartFixup()
     return true
 end
 
--- Override DZ's broken SyncVanillaKillCounter with our per-player version.
--- The original uses a single global baseline that causes kill count inflation
--- on player reconnect (see kill count bug analysis in README.md).
+-- Override DZ's broken SyncVanillaKillCounter with our vanilla-truth version.
+-- DZ's original uses a single global baseline that resets on restart
+-- (vanillaKillBaseline=0 when no players at OnGameStart) and inflates
+-- totalKills when players reconnect. Our version uses each player's
+-- getZombieKills() as the persistent source of truth.
 local function installKillSyncFix()
     if not DynamicZ then return false end
 
-    -- Load persisted baselines from previous session / before restart
-    local saved = readPlayerBaselines()
+    -- Load last-known kills from previous session (includes offline players)
+    local saved = readPlayerKills()
     local count = 0
-    for username, baseline in pairs(saved) do
-        playerKillBaselines[username] = baseline
+    for username, kills in pairs(saved) do
+        playerKills[username] = kills
         count = count + 1
     end
     if count > 0 then
-        logInfo(string.format("Loaded %d player kill baselines from file.", count))
+        logInfo(string.format("Loaded %d player kill records from file.", count))
     end
 
-    -- Replace DZ's SyncVanillaKillCounter so any code that calls it
-    -- (including DZ's own OnGameStart at DZ_Core.lua:182) uses our safe version
-    DynamicZ.SyncVanillaKillCounter = syncVanillaKillsPerPlayer
+    DynamicZ.SyncVanillaKillCounter = syncVanillaKills
     DynamicZ._DZChatCmds_KillSyncFixed = true
-    logInfo("SyncVanillaKillCounter replaced with per-player baseline version.")
+    logInfo("SyncVanillaKillCounter replaced with vanilla-truth version.")
     return true
 end
 
@@ -1483,8 +1473,7 @@ local function ensureFixup()
     if not DynamicZ or not DynamicZ.Global then return end
     logInfo("Lazy-init: running fixup from first client command.")
     installAllFixes()
-    -- Per-player kill sync runs via installKillSyncFix (loaded baselines + replaced SyncVanillaKillCounter)
-    syncVanillaKillsPerPlayer()
+    syncVanillaKills()
     if onGameStartFixup() then
         fixupComplete = true
     end
@@ -1691,12 +1680,16 @@ local function onClientCommand(module, command, player, args)
             lines[#lines + 1] = "Pressure: not installed"
         end
 
-        -- Per-player kill baselines
-        local baselineCount = 0
-        for _ in pairs(playerKillBaselines) do baselineCount = baselineCount + 1 end
-        lines[#lines + 1] = string.format("Kill baselines tracked: %d players", baselineCount)
-        for username, baseline in pairs(playerKillBaselines) do
-            lines[#lines + 1] = string.format("  %s: baseline=%d", username, math.floor(baseline))
+        -- Per-player kill tracking
+        local playerCount = 0
+        local vanillaSum = 0
+        for _, kills in pairs(playerKills) do
+            playerCount = playerCount + 1
+            vanillaSum = vanillaSum + math.floor(kills)
+        end
+        lines[#lines + 1] = string.format("Player kills tracked: %d players, vanilla sum=%d", playerCount, vanillaSum)
+        for username, kills in pairs(playerKills) do
+            lines[#lines + 1] = string.format("  %s: kills=%d", username, math.floor(kills))
         end
 
         -- Player access level
@@ -1751,7 +1744,7 @@ if not DynamicZ_ChatCmds_ServerLoaded then
             if DynamicZ.Global.totalKills == nil then return end
             logInfo("EveryOneMinute fallback: OnGameStart may not have fired, running fixup now.")
             installAllFixes()
-            syncVanillaKillsPerPlayer()
+            syncVanillaKills()
             if onGameStartFixup() then
                 fixupComplete = true
             end
@@ -1760,7 +1753,7 @@ if not DynamicZ_ChatCmds_ServerLoaded then
 
         -- Per-player kill sync: catches kills the event path may have missed
         -- (e.g., vehicle kills). Once per minute is sufficient.
-        syncVanillaKillsPerPlayer()
+        syncVanillaKills()
         if DynamicZ.TryAutoSeedLeaders then
             DynamicZ.TryAutoSeedLeaders()
         end
