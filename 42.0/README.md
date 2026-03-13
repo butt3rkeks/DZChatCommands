@@ -1,6 +1,6 @@
 # Dynamic Evolution Z - MP Fixes
 
-Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes 15 bugs that break DZ on dedicated servers, adds an activity pressure system, and provides admin chat commands for managing the evolution system.
+Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes 16 bugs that break DZ on dedicated servers, adds an activity pressure system, and provides admin chat commands for managing the evolution system.
 
 Does not modify any DZ files. All fixes are applied at runtime via function wrapping. Safe to add or remove at any time.
 
@@ -81,6 +81,11 @@ DZ's `getZombieDebugId` (local in `DZ_Leader.lua`) checks `DynamicZ.GetZombieDeb
 ### 15. DebugTrackTick on non-existent EveryOneSecond
 DZ registers `DebugTrackTick` on `EveryOneSecond` (`DZ_Debug.lua:1501`). The server-side zombie tracking feature (admin inspect/track with diff-snapshots) never ticks. Fix: calls `DebugTrackTick()` from the `OnTick` handler alongside `AdvanceLeaderTick`. `DebugTrackTick` has its own internal time-based throttle.
 
+### 16. SyncVanillaKillCounter broken on dedicated server
+DZ's `SyncVanillaKillCounter` sets `vanillaKillBaseline` to 0 at `OnGameStart` (no players are connected yet on a dedicated server). It then registers on `EveryOneSecond` which doesn't exist, so the sync never runs again. Combined with fix 1 (ModData loss), `totalKills` resets to 0 on every restart and only grows from `OnZombieDead` events during that session.
+
+Fix: replaces `SyncVanillaKillCounter` with a vanilla-truth sync. Each player's `getZombieKills()` is the source of truth — PZ serializes this to the player save file, so it persists across restarts without any backup needed. Every game-minute, sums all tracked players' vanilla kill counts and sets `totalKills = max(totalKills, vanillaSum)`. Per-player values are persisted to `DZChatCommands_PlayerKills.ini` so offline players' kills are retained. The `max()` preserves any unattributed kills (fire, environmental) that DZ's `OnZombieDead` handler counted above the vanilla sum.
+
 ### Admin debug access
 DZ's debug system requires the sandbox `EnableDebugMode` setting. Fix: sets `DynamicZ.DebugEnabled = true` server-side at startup, which propagates to clients via `buildStatePayload`. The existing admin check in `canUseDebugUI` ensures only admins see the overlay and can use debug commands.
 
@@ -142,7 +147,7 @@ Server responses (`DebugInfo` and `DebugState`) are displayed in chat with dedup
 42.0/
   media/lua/
     server/DZChatCommands/
-      dz_persistence.lua     # All 15 server-side fixes + ForceSave/Diagnostics commands
+      dz_persistence.lua     # All 16 server-side fixes + ForceSave/Diagnostics commands
       dz_pressure.lua        # Activity pressure system (heat map, migration/evo/seed hooks)
     client/DZChatCommands/
       dz_chat.lua            # Chat command bridge (/dz <subcommand>)
