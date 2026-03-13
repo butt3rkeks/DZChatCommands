@@ -1,7 +1,7 @@
 --[[
     DZChatCommands - Server-side persistence & pathfinding fixes for Dynamic Evolution Z
 
-    Active fixes (7 remaining after DZ update — fixes 2,3,5,6,7,12,13,14,15 now fixed upstream):
+    Active fixes (9 remaining after DZ update — fixes 2,3,5,6,7,12,13,14,15 now fixed upstream):
 
     1. ModData persistence loss on restart: ModData.getOrCreate returns empty
        table on dedicated server restart, losing all saved state. Fixed by
@@ -33,6 +33,15 @@
        players — offline player kills vanish from the sum. Fixed by tracking
        per-player getZombieKills() persisted to file, with totalKills =
        max(totalKills, sum of all known player kills).
+   17. Dead setLastHeardSound in cohesion drift: TryCohesionDrift computes a
+       centroid of nearby peers and calls dead setLastHeardSound to bias the
+       zombie toward the group center. Fixed by wrapping TryCohesionDrift to
+       re-derive the centroid via grid traversal and call pathToLocationF.
+   18. Dead setLastHeardSound in thump-release re-issue:
+       reissueDirectiveAfterThumpRelease calls dead setLastHeardSound for
+       both migration followers (line 543) and ambient wander (line 557)
+       after clearing a stale thump target. Fixed by wrapping
+       TryReleaseStaleThumpTarget to read stored coords and pathToLocationF.
 
     Additionally enables debug UI for admin players (bypasses sandbox setting).
 
@@ -45,7 +54,8 @@
     - Wraps SaveGlobalState to write file-based backup (fix 1).
     - Uses EveryOneMinute fallback for init (fix 4).
     - Wraps ApplyStageEvolutionBuffs (fixes 8, 9), TryAmbientWander (fix 10),
-      and ApplyLeaderInfluence (fix 11) to replace dead setLastHeardSound
+      ApplyLeaderInfluence (fix 11), TryCohesionDrift (fix 17), and
+      TryReleaseStaleThumpTarget (fix 18) to replace dead setLastHeardSound
       calls with pathToLocationF.
     - Replaces SyncVanillaKillCounter with per-player vanilla-truth sync (fix 16).
     - Provides "ForceSave" and "Diagnostics" network commands.
@@ -869,6 +879,196 @@ end
 
 
 
+-- Install pathfinding fix for cohesion drift (fix 17).
+--
+-- DZ_Leader.lua's TryCohesionDrift computes a centroid of nearby eligible
+-- peers (reservoir-sampled), applies a strength multiplier, and calls dead
+-- setLastHeardSound to bias the zombie toward the group center. The drift
+-- target is ephemeral (local variables, never stored in modData), so we
+-- can't read it post-call like the wander fix does.
+--
+-- Strategy: snapshot dz.cohesionLastDriftHour before the original. If it
+-- changed (drift occurred), re-derive the approximate centroid using our
+-- own grid traversal and path there. The result may differ slightly from
+-- DZ's reservoir-sampled subset, but the directional intent is equivalent.
+local function installCohesionDriftFix()
+    if not DynamicZ or not DynamicZ.TryCohesionDrift then
+        logInfo("WARN installCohesionDriftFix: DynamicZ.TryCohesionDrift not available.")
+        return false
+    end
+    if DynamicZ._DZChatCmds_CohesionDriftFixed then
+        logInfo("Cohesion drift fix already installed.")
+        return true
+    end
+
+    local origTryCohesionDrift = DynamicZ.TryCohesionDrift
+
+    DynamicZ.TryCohesionDrift = function(zombie, dz)
+        -- Resolve dz before call so we can snapshot
+        dz = dz or (zombie and zombie.getModData and zombie:getModData() and zombie:getModData().DZ)
+        local prevDriftHour = dz and toNumber(dz.cohesionLastDriftHour, nil)
+
+        local result = origTryCohesionDrift(zombie, dz)
+
+        -- Only act if DZ actually decided to drift (cohesionLastDriftHour updated)
+        if result ~= true then return result end
+        if not zombie or not dz then return result end
+
+        local newDriftHour = toNumber(dz.cohesionLastDriftHour, nil)
+        if not newDriftHour or newDriftHour == prevDriftHour then return result end
+
+        -- Re-derive approximate centroid from nearby zombies on the same floor.
+        -- DZ uses reservoir sampling from peers with isEligibleCohesionPeer;
+        -- we use a simpler full-average of nearby zombies that are under leader
+        -- influence or migrating (the two conditions DZ requires for drift eligibility).
+        local zx = toNumber(zombie:getX(), nil)
+        local zy = toNumber(zombie:getY(), nil)
+        local zz = math.floor(toNumber(zombie:getZ(), 0))
+        if not zx or not zy then return result end
+
+        local Config = DynamicZ_Config or {}
+        local radius = math.max(2, math.floor(toNumber(Config.CohesionDriftNeighborRadius, 6)))
+
+        local cell = getCell and getCell()
+        if not cell then return result end
+
+        local cx = math.floor(zx)
+        local cy = math.floor(zy)
+        local radiusSq = radius * radius
+        local sumX, sumY, count = 0, 0, 0
+
+        for gx = cx - radius, cx + radius do
+            for gy = cy - radius, cy + radius do
+                local dx = gx - cx
+                local dy = gy - cy
+                if (dx * dx + dy * dy) <= radiusSq then
+                    local ok, sq = pcall(function() return cell:getGridSquare(gx, gy, zz) end)
+                    if ok and sq then
+                        local ok2, movObjs = pcall(function() return sq:getMovingObjects() end)
+                        if ok2 and movObjs then
+                            for i = 0, movObjs:size() - 1 do
+                                local obj = movObjs:get(i)
+                                if obj and obj ~= zombie and instanceof and instanceof(obj, "IsoZombie") then
+                                    local fMD = obj.getModData and obj:getModData()
+                                    local fDZ = fMD and fMD.DZ
+                                    if fDZ then
+                                        local nowH = getNowHours()
+                                        local eligible = fDZ.isMigrating == true
+                                            or (fDZ.leaderInfluence == true
+                                                and toNumber(fDZ.leaderInfluenceUntil, 0) > nowH)
+                                        if eligible then
+                                            sumX = sumX + toNumber(obj:getX(), zx)
+                                            sumY = sumY + toNumber(obj:getY(), zy)
+                                            count = count + 1
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if count < 2 then return result end
+
+        local centerX = sumX / count
+        local centerY = sumY / count
+        local ddx = centerX - zx
+        local ddy = centerY - zy
+        local distance = math.sqrt((ddx * ddx) + (ddy * ddy))
+        if distance <= 0.5 then return result end
+
+        local strength = clamp(toNumber(Config.CohesionDriftStrength, 0.45), 0.10, 1.0)
+        local driftX = zx + (ddx * strength)
+        local driftY = zy + (ddy * strength)
+
+        if pathToLocation(zombie, driftX, driftY, zz) then
+            logInfo(string.format(
+                "Cohesion drift fix: zombie %d pathing toward group center (%.0f, %.0f) peers=%d",
+                zombie:getID(), driftX, driftY, count))
+        end
+
+        return result
+    end
+
+    DynamicZ._DZChatCmds_CohesionDriftFixed = true
+    logInfo("Cohesion drift fix installed: TryCohesionDrift wrapped with pathToLocationF.")
+    return true
+end
+
+-- Install pathfinding fix for thump-release re-issue (fix 18).
+--
+-- DZ_Leader.lua's TryReleaseStaleThumpTarget detects zombies that have been
+-- thumping a barricade too long with no player nearby, clears their thump
+-- target, then calls the local reissueDirectiveAfterThumpRelease to redirect
+-- them. That function uses dead setLastHeardSound for both migration followers
+-- (line 543) and ambient wander re-issue (line 557). The migration leader
+-- branch (line 541) correctly uses tryPathToLocation, but non-leaders get
+-- no actual movement.
+--
+-- The coords ARE stored in dz moddata: migrationTargetX/Y/Z for migrating
+-- zombies, ambientLastTargetX/Y/Z for wandering zombies. We wrap
+-- TryReleaseStaleThumpTarget and if it returns true, read the appropriate
+-- coords and call pathToLocationF.
+local function installThumpReleaseFix()
+    if not DynamicZ or not DynamicZ.TryReleaseStaleThumpTarget then
+        logInfo("WARN installThumpReleaseFix: DynamicZ.TryReleaseStaleThumpTarget not available.")
+        return false
+    end
+    if DynamicZ._DZChatCmds_ThumpReleaseFixed then
+        logInfo("Thump release fix already installed.")
+        return true
+    end
+
+    local origTryReleaseStaleThumpTarget = DynamicZ.TryReleaseStaleThumpTarget
+
+    DynamicZ.TryReleaseStaleThumpTarget = function(zombie, dz)
+        local result = origTryReleaseStaleThumpTarget(zombie, dz)
+
+        -- Only act when release actually happened
+        if result ~= true then return result end
+        if not zombie then return result end
+
+        dz = dz or (zombie.getModData and zombie:getModData() and zombie:getModData().DZ)
+        if not dz then return result end
+
+        local targetX, targetY, targetZ
+
+        if dz.isMigrating == true then
+            -- Migration case: leader already got pathToLocation from DZ (line 541).
+            -- Non-leader followers only got dead setLastHeardSound (line 543).
+            if dz.migrationRole ~= "leader" then
+                targetX = toNumber(dz.migrationTargetX, nil)
+                targetY = toNumber(dz.migrationTargetY, nil)
+                targetZ = math.floor(toNumber(dz.migrationTargetZ,
+                    zombie.getZ and toNumber(zombie:getZ(), 0) or 0))
+            end
+        else
+            -- Ambient wander re-issue: dead setLastHeardSound at line 557.
+            targetX = toNumber(dz.ambientLastTargetX, nil)
+            targetY = toNumber(dz.ambientLastTargetY, nil)
+            targetZ = math.floor(toNumber(dz.ambientLastTargetZ,
+                zombie.getZ and toNumber(zombie:getZ(), 0) or 0))
+        end
+
+        if targetX and targetY then
+            if pathToLocation(zombie, targetX, targetY, targetZ or 0) then
+                logInfo(string.format(
+                    "Thump release fix: zombie %d pathing to (%.0f, %.0f, %.0f) mode=%s",
+                    zombie:getID(), targetX, targetY, targetZ or 0,
+                    tostring(dz.ambientMode or dz.migrationRole or "?")))
+            end
+        end
+
+        return result
+    end
+
+    DynamicZ._DZChatCmds_ThumpReleaseFixed = true
+    logInfo("Thump release fix installed: TryReleaseStaleThumpTarget wrapped with pathToLocationF.")
+    return true
+end
+
 -- Core fixup: restore from backup if ModData was empty,
 -- then compute correct worldEvolution using actual world age.
 local function onGameStartFixup()
@@ -977,13 +1177,16 @@ end
 -- Called from multiple init paths (OnGameStart, EveryOneMinute, ensureFixup).
 -- NOTE: Fixes 2,3,5,6,7,12,13,14,15 removed — now fixed natively in DZ update.
 -- Remaining active fixes: 1 (backup), 4 (OnGameStart fallback), 8-9 (search/sense),
--- 10 (wander), 11 (leader follower), 16 (kill sync), admin debug access.
+-- 10 (wander), 11 (leader follower), 16 (kill sync), 17 (cohesion drift),
+-- 18 (thump release), admin debug access.
 local function installAllFixes()
     installSaveHook()
     installKillSyncFix()
     installSearchFix()
     installWanderFix()
     installLeaderFix()
+    installCohesionDriftFix()
+    installThumpReleaseFix()
     installAdminDebugAccess()
 end
 
@@ -1091,6 +1294,10 @@ local function onClientCommand(module, command, player, args)
             tostring(DynamicZ and DynamicZ._DZChatCmds_LeaderFixed or false))
         lines[#lines + 1] = string.format("KillSyncFixed: %s",
             tostring(DynamicZ and DynamicZ._DZChatCmds_KillSyncFixed or false))
+        lines[#lines + 1] = string.format("CohesionDriftFixed: %s",
+            tostring(DynamicZ and DynamicZ._DZChatCmds_CohesionDriftFixed or false))
+        lines[#lines + 1] = string.format("ThumpReleaseFixed: %s",
+            tostring(DynamicZ and DynamicZ._DZChatCmds_ThumpReleaseFixed or false))
         lines[#lines + 1] = string.format("DynamicZ loaded: %s",
             tostring(DynamicZ ~= nil))
         lines[#lines + 1] = string.format("Global available: %s",

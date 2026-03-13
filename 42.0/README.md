@@ -1,6 +1,6 @@
 # Dynamic Evolution Z - MP Fixes
 
-Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes 7 bugs that break DZ on dedicated servers and provides admin chat commands for managing the evolution system.
+Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes 9 bugs that break DZ on dedicated servers and provides admin chat commands for managing the evolution system.
 
 Does not modify any DZ files. All fixes are applied at runtime via function wrapping. Safe to add or remove at any time.
 
@@ -58,6 +58,12 @@ DZ's `ApplyLeaderInfluence` calls dead `setLastHeardSound` to direct followers t
 ### 16. SyncVanillaKillCounter loses offline player kills
 DZ's `SyncVanillaKillCounter` only sums online players' kills — offline players' kills disappear from the sum. Fix: replaces `SyncVanillaKillCounter` with a vanilla-truth sync. Each player's `getZombieKills()` is the source of truth — PZ serializes this to the player save file, so it persists across restarts. Per-player values are persisted to `DZChatCommands_PlayerKills.ini` so offline players' kills are retained. `totalKills = max(totalKills, vanillaSum)` preserves unattributed kills (fire, environmental).
 
+### 17. Dead setLastHeardSound in cohesion drift
+DZ's `TryCohesionDrift` computes a centroid of nearby eligible peers and calls dead `setLastHeardSound` to bias the zombie toward the group center. The drift target is ephemeral (local variables, never stored in modData). Fix: wraps `TryCohesionDrift`, detects when drift occurred via `cohesionLastDriftHour` change, re-derives the approximate centroid using grid traversal of nearby influenced/migrating zombies, and calls `pathToLocationF`.
+
+### 18. Dead setLastHeardSound in thump-release re-issue
+DZ's `reissueDirectiveAfterThumpRelease` (local function called from `TryReleaseStaleThumpTarget`) clears a stale thump target and re-issues the zombie's previous movement directive. Migration leaders correctly use `tryPathToLocation` (line 541), but migration followers (line 543) and ambient wander re-issue (line 557) use dead `setLastHeardSound`. Fix: wraps `TryReleaseStaleThumpTarget` and reads the stored coords from modData (`migrationTargetX/Y/Z` or `ambientLastTargetX/Y/Z`) to call `pathToLocationF`.
+
 ### Admin debug access
 DZ's debug system requires the sandbox `EnableDebugMode` setting. Fix: sets `DynamicZ.DebugEnabled = true` server-side at startup, propagated to clients via `buildStatePayload`. The existing admin check in `canUseDebugUI` ensures only admins see the overlay.
 
@@ -107,7 +113,7 @@ Server responses (`DebugInfo` and `DebugState`) are displayed in chat with dedup
 42.0/
   media/lua/
     server/DZChatCommands/
-      dz_persistence.lua     # 7 active server-side fixes + ForceSave/Diagnostics commands
+      dz_persistence.lua     # 9 active server-side fixes + ForceSave/Diagnostics commands
     client/DZChatCommands/
       dz_chat.lua            # Chat command bridge (/dz <subcommand>)
       dz_debug_overlay_fix.lua  # Debug HUD overlay fixes
