@@ -62,7 +62,6 @@ commands.help = function(args)
     showInfo("  /dz reset               - Reset all DZ state")
     showInfo("  /dz forcesave           - Force save to backup file")
     showInfo("  /dz diag                - Show server diagnostics")
-    showInfo("  /dz pressure            - Show activity pressure map")
     showInfo("  Leader types: HIVE, HUNTER, FRENZY, SHADOW, SPLIT")
 end
 
@@ -144,12 +143,8 @@ commands.diag = function(args)
 end
 
 commands.pressure = function(args)
-    showInfo("Requesting pressure map from server...")
-    if sendClientCommand then
-        sendClientCommand("DZChatCmds", "Pressure", {})
-    else
-        showError("sendClientCommand not available.")
-    end
+    showInfo("Pressure system is now native to DZ (DZ_Pressure.lua).")
+    showInfo("Use DZ's built-in pressure diagnostics instead.")
 end
 
 -- Listen for DynamicZ server responses and show them in chat

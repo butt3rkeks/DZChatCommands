@@ -1,129 +1,58 @@
 --[[
-    DZChatCommands - Server-side persistence fix for Dynamic Evolution Z
+    DZChatCommands - Server-side persistence & pathfinding fixes for Dynamic Evolution Z
 
-    Problems fixed:
-    1. ModData.getOrCreate("DynamicZ_Global") returns empty table on dedicated
-       server restart, losing all saved state.
-    2. RecalculateWorldEvolution is never called on startup, so world age
-       is not reflected until the first zombie dies or midnight passes.
-    3. The DZ mod calls gameTime:getWorldAgeDays() but that method is on
-       IsoWorld, not GameTime. So DZ always computes days=0.
-       We use getWorldAgeHours()/24 or getWorldAgeDaysSinceBegin() instead.
-    4. Events.OnGameStart.Add may not fire on dedicated servers (DZ uses
-       addEvent which may work differently). We use EveryOneMinute fallback.
-    5. DZ registers AdvanceLeaderTick on "EveryOneSecond" which does not exist
-       in PZ. pulseId stays 0, leader system is dead. Fixed via OnTick.
-    6. DZ registers RecalculateWorldEvolution on "OnMidnight" which does not
-       exist in PZ. World evolution never recalculates during play. Fixed via
-       EveryDays (fires at in-game day rollover).
-    7. DZ calls getNumActiveZombies() which does not exist in Build 42.
-       Auto-seeding never triggers, max leaders capped at 1. Fixed via
-       polyfill using getCell():getZombieList():size().
-    8. DZ's search-after-target-loss uses setLastHeardSound which is dead
-       code in PZ B42 (field written but never read by any game logic).
-       Evolved zombies should search the player's last known position
-       after losing sight, but the call has zero behavioral effect. Fixed
-       by wrapping ApplyStageEvolutionBuffs with pathToLocationF (A*-capable
-       pathfinding via PathFindBehavior2/PolygonalMap2). Enhanced with
-       player ID tracking: stores the targeted player's onlineID/username
-       while the zombie has a target, then looks them up via
-       getPlayerByOnlineID (O(1) HashMap, LuaManager.java:3488) after
-       target loss to path toward the player's CURRENT position instead
-       of a stale last-known location. Re-paths every 3 seconds for the
-       duration of DZ's search window (computeSearchWindowHours, based on
-       stage and persistence buff). Falls back to static last-known
-       position if the player disconnected or died. Tracking is strictly
-       time-limited (never infinite). Also compensates for the
-       inaccessible zombie.memory field: setTarget won't stick because
-       timeSinceSeenFlesh can't be reset from Lua (it's a field, not a
-       method), so repeated pathToLocation tracking is the best
-       equivalent to extended memory.
-    9. DZ's applyStage4Sense calls dead setLastHeardSound when a stage 4+
-       zombie senses a nearby player (without direct line of sight). The
-       zombie should investigate toward the sensed player but never moves.
-       Fixed by extending the ApplyStageEvolutionBuffs wrapper to also
-       replicate findNearestPlayer and call pathToLocationF to the detected
-       player's current position.
-   10. DZ's TryAmbientWander calls dead setLastHeardSound to make idle
-       zombies wander toward computed target positions (influenced by nearby
-       player presence and reactive kill signals). The zombie never moves.
-       Fixed by wrapping TryAmbientWander to read the stored target coords
-       from modData and call pathToLocationF after the original succeeds.
-   11. DZ's leader system (ApplyLeaderInfluence) calls dead setLastHeardSound
-       to direct followers toward the leader's target, leader's position,
-       or migration waypoints. Followers never actually move toward these
-       coordinates. Fixed by wrapping ApplyLeaderInfluence to iterate
-       influenced followers and call pathToLocationF with the appropriate
-       coordinates per leader type (HUNTER/FRENZY/SHADOW/HIVE: leader's
-       target or leader position; SPLIT: 3-way flanking offset computed
-       from follower position hash, replicating DZ's local computeSplitPoint;
-       migrating: blended migration target).
-   12. DZ's getWorldAgeDaysSafe() (local in DZ_GlobalState.lua) has a fallback
-       path that uses getWorldAgeHours()/24 without adding the timeSinceApo
-       sandbox offset. The primary path (getWorldAgeDaysSinceBegin) includes
-       it, but if that pcall ever fails, the fallback silently drops the
-       offset. Since getWorldAgeDaysSafe is local, it can't be patched.
-       Fixed by replacing the entire DynamicZ.RecalculateWorldEvolution
-       function with one that uses the companion mod's corrected
-       getWorldAgeDays() (which always includes timeSinceApo).
-   13. DZ's AdvanceLeaderTick uses Config.LeaderPulseInterval with a
-       hardcoded fallback of 180. Since LeaderPulseInterval is not in
-       DZ's default sandbox config, the fallback always applies: pulses
-       fire every 180 ticks = 180 seconds = 3 minutes. Leaders only act
-       (TryLeaderPulse) when a pulse fires, making the leader system
-       extremely sluggish. Fixed by replacing AdvanceLeaderTick with a
-       version using fallback=3 (pulse every 3 seconds).
-   15. DZ registers DebugTrackTick on "EveryOneSecond" (DZ_Debug.lua:1501)
-       which does not exist in PZ. The server-side zombie tracking feature
-       (admin inspect/track with diff-snapshots and auto-updates) never ticks.
-       Fixed by calling DynamicZ.DebugTrackTick() from the OnTick handler
-       alongside AdvanceLeaderTick. DebugTrackTick has its own internal
-       time-based throttle (getNowHours vs nextTickHour using
-       Config.DebugTrackIntervalSeconds, default 2s), so calling it every
-       ~1 second from OnTick is appropriate — it will self-throttle.
-   14. DZ's local getZombieDebugId (DZ_Leader.lua:43) checks
-       DynamicZ.GetZombieDebugId first, then falls back to position
-       "P:x:y:z". By default GetZombieDebugId is nil, so all debug
-       logging uses ambiguous position strings. Fixed by setting
-       GetZombieDebugId to try getOnlineID ("O<id>"), then getID
-       ("R<id>" — IsoMovingObject's monotonic counter), then position.
-       This also improves getZombieRuntimeId's fallback chain (line 188
-       calls getZombieDebugId as its last resort).
-   16. DZ's SyncVanillaKillCounter uses a single global vanillaKillBaseline
-       that resets on server restart (set to 0 at OnGameStart when no players
-       are connected yet). On dedicated server, EveryOneSecond is dead so the
-       sync never runs again — totalKills only grows from OnZombieDead events
-       and resets to 0 on every restart (ModData persistence bug). Fixed by
-       replacing SyncVanillaKillCounter with a vanilla-truth sync: tracks
-       each player's getZombieKills() (persisted to file for offline players),
-       sets totalKills = max(totalKills, sum of all player kills). The vanilla
-       counter is PZ's own persistent source of truth — survives restarts
-       without any backup needed.
+    Active fixes (7 remaining after DZ update — fixes 2,3,5,6,7,12,13,14,15 now fixed upstream):
+
+    1. ModData persistence loss on restart: ModData.getOrCreate returns empty
+       table on dedicated server restart, losing all saved state. Fixed by
+       wrapping SaveGlobalState to write a file-based backup, and restoring
+       from it during fixup.
+    4. OnGameStart may not fire on dedicated servers: DZ uses addEvent which
+       may not fire reliably. Fixed via EveryOneMinute fallback that runs
+       fixup if OnGameStart was missed.
+    8. Dead setLastHeardSound in search-after-target-loss: DZ's
+       applyPersistenceAndSearch calls setLastHeardSound which is dead code
+       in PZ B42 (field written but never read). Evolved zombies should search
+       the player's last known position after losing sight, but the call has
+       zero effect. Fixed by wrapping ApplyStageEvolutionBuffs with
+       pathToLocationF (A* pathfinding via PathFindBehavior2/PolygonalMap2).
+       Enhanced with player ID tracking for re-pathing to CURRENT position.
+    9. Dead setLastHeardSound in stage 4 sense: applyStage4Sense calls dead
+       setLastHeardSound when a stage 4+ zombie senses a nearby player. Fixed
+       by extending the ApplyStageEvolutionBuffs wrapper to replicate
+       findNearestPlayer and call pathToLocationF to the sensed player.
+   10. Dead setLastHeardSound in ambient wander: TryAmbientWander calls dead
+       setLastHeardSound for idle zombie movement. Fixed by wrapping
+       TryAmbientWander to read target coords from modData and call
+       pathToLocationF after the original succeeds.
+   11. Dead setLastHeardSound in leader follower direction: ApplyLeaderInfluence
+       calls dead setLastHeardSound to direct followers. Fixed by wrapping it
+       to iterate influenced followers and call pathToLocationF per leader type
+       (HUNTER/FRENZY/SHADOW/HIVE/SPLIT/migrating).
+   16. SyncVanillaKillCounter offline player loss: DZ's sync only sums online
+       players — offline player kills vanish from the sum. Fixed by tracking
+       per-player getZombieKills() persisted to file, with totalKills =
+       max(totalKills, sum of all known player kills).
+
+    Additionally enables debug UI for admin players (bypasses sandbox setting).
 
     Unfixable from companion mod (require upstream changes):
-    - zombie:getMemory()/setMemory() don't exist. memory is a public int
-      field but PZ's Kahlua bridge only exposes methods, not fields.
-      The memory buff itself is dead, but fix #8 provides a behavioral
-      workaround (active search instead of passive forget-time extension).
-    - getZombieRuntimeId() uses getObjectID() which doesn't exist on
-      IsoZombie. Local function, can't override. However, it tries
-      getOnlineID() first (works in MP), so this is NOT broken on
-      dedicated servers. Fix 14 improves the final fallback (position ->
-      getID-based) since getZombieRuntimeId calls getZombieDebugId at
-      line 188 as its last resort.
+    - zombie:getMemory()/setMemory() don't exist (Kahlua exposes methods only).
+    - getZombieRuntimeId() uses non-existent getObjectID(), but getOnlineID()
+      works first in MP so this is not broken on dedicated servers.
 
     Solution:
-    - Wraps DynamicZ.SaveGlobalState to also write a backup file via
-      getFileWriter (independent of ModData).
-    - After DZ initializes, restores from backup + computes correct
-      worldEvolution using the actual world age.
-    - Polyfills missing global functions (getNumActiveZombies).
+    - Wraps SaveGlobalState to write file-based backup (fix 1).
+    - Uses EveryOneMinute fallback for init (fix 4).
     - Wraps ApplyStageEvolutionBuffs (fixes 8, 9), TryAmbientWander (fix 10),
       and ApplyLeaderInfluence (fix 11) to replace dead setLastHeardSound
       calls with pathToLocationF.
-    - Replaces SyncVanillaKillCounter with vanilla-truth sync (fix 16):
-      uses each player's getZombieKills() as persistent source of truth.
+    - Replaces SyncVanillaKillCounter with per-player vanilla-truth sync (fix 16).
     - Provides "ForceSave" and "Diagnostics" network commands.
+
+    NOTE: Pressure system removed — DZ now has native DZ_Pressure.lua that is
+    fully integrated into DZ_Evolution and DZ_Leader. Running both would cause
+    double pressure accumulation and double evolution/migration influence.
 ]]
 
 local BACKUP_FILE = "DZChatCommands_GlobalState.ini"
@@ -140,23 +69,6 @@ local fixupComplete = false
 -- own save data, so we never lose kill history.
 local playerKills = {}
 
--- Polyfill: getNumActiveZombies() does not exist in Build 42.
--- DZ_Leader.lua calls it for auto-seeding and max leader calculation.
--- Without it, getNumActiveZombiesSafe() returns 0, auto-seeding never
--- triggers, and max leaders is capped at 1.
--- Uses getCell():getZombieList():size() — the same pattern DZ itself uses
--- in recountLoadedLeaders() and TryAutoSeedLeaders.
-if not getNumActiveZombies then
-    function getNumActiveZombies()
-        local cell = getCell and getCell()
-        if not cell then return 0 end
-        local ok, zombieList = pcall(function() return cell:getZombieList() end)
-        if not ok or not zombieList then return 0 end
-        local ok2, size = pcall(function() return zombieList:size() end)
-        if not ok2 then return 0 end
-        return size
-    end
-end
 
 local function toNumber(value, fallback)
     local n = tonumber(value)
@@ -373,70 +285,6 @@ local function computeSearchWindowHours(stage)
     return searchSeconds / 3600.0
 end
 
--- Get world age in days from game time.
--- CRITICAL: gameTime:getWorldAgeDays() is on IsoWorld, NOT GameTime.
--- DZ_GlobalState.lua has this bug (line 80) — RecalculateWorldEvolution always
--- gets days=0 because gameTime.getWorldAgeDays is nil.
--- We use getWorldAgeHours()/24 which IS proven from vanilla PZ Lua
--- (ISPlowAction, forageSystem, ISWeatherChannel, Vehicles, etc.).
--- The timeSinceApo offset uses the exact vanilla pattern from ISWeatherChannel.lua:
---   getGameTime():getWorldAgeHours() / 24 + (getSandboxOptions():getTimeSinceApo() - 1) * 30
-local function getWorldAgeDays()
-    if getGameTime then
-        local gameTime = getGameTime()
-        if gameTime then
-            -- Primary: getWorldAgeHours / 24 (proven in vanilla PZ Lua)
-            if gameTime.getWorldAgeHours then
-                local hours = toNumber(gameTime:getWorldAgeHours(), 0)
-                local days = hours / 24.0
-                -- Add timeSinceApo offset (vanilla pattern from ISWeatherChannel.lua)
-                if getSandboxOptions then
-                    local opts = getSandboxOptions()
-                    if opts and opts.getTimeSinceApo then
-                        days = days + (toNumber(opts:getTimeSinceApo(), 1) - 1) * 30
-                    end
-                end
-                return days
-            end
-            -- Fallback: getNightsSurvived (also proven in vanilla ISWeatherChannel.lua)
-            if gameTime.getNightsSurvived then
-                return toNumber(gameTime:getNightsSurvived(), 0)
-            end
-        end
-    end
-    -- Last resort: IsoWorld has getWorldAgeDays (not GameTime)
-    if getWorld then
-        local world = getWorld()
-        if world and world.getWorldAgeDays then
-            return toNumber(world:getWorldAgeDays(), 0)
-        end
-    end
-    logInfo("getWorldAgeDays: no method available to determine world age")
-    return 0
-end
-
--- Compute worldEvolution directly using DZ's formula.
--- This is needed because:
--- 1. RecalculateWorldEvolution may return early (evo disabled)
--- 2. RecalculateWorldEvolution uses the broken getWorldAgeDays on GameTime
---    and always gets days=0. We use the correct method.
-local function computeWorldEvolution(totalKills)
-    local Config = DynamicZ_Config or {}
-    local timeFactor = toNumber(Config.TimeFactor, 0.005)
-    local killFactor = toNumber(Config.KillFactor, 0.0005)
-    local maxEvo = toNumber(Config.MaxWorldEvolution, 1.0)
-    local days = getWorldAgeDays()
-    local kills = toNumber(totalKills, 0)
-
-    local evo = (days * timeFactor) + (kills * killFactor)
-    evo = clamp(evo, 0.0, maxEvo)
-
-    logInfo(string.format(
-        "computeWorldEvolution: days=%.1f * timeFactor=%.4f + kills=%d * killFactor=%.5f = %.4f (max=%.1f)",
-        days, timeFactor, kills, killFactor, evo, maxEvo))
-
-    return evo
-end
 
 -- File-based backup write
 local function writeBackup()
@@ -593,14 +441,6 @@ local function installSaveHook()
     DynamicZ.SaveGlobalState = function()
         original()
         writeBackup()
-        -- Also persist pressure data so it survives graceful shutdown.
-        -- Guard with isInstalled() to avoid overwriting a valid pressure file
-        -- with empty data if the pressure system failed to install.
-        if DZChatCommands_Pressure and DZChatCommands_Pressure.isInstalled
-                and DZChatCommands_Pressure.isInstalled()
-                and DZChatCommands_Pressure.writePressureFile then
-            DZChatCommands_Pressure.writePressureFile()
-        end
     end
     DynamicZ._DZChatCmds_SaveHooked = true
     logInfo("SaveGlobalState hook installed.")
@@ -851,54 +691,6 @@ end
 --      offset by Config.LeaderSplitFlankDistance in 3 directions)
 --    - Migrating followers: blended migration target (replicating DZ's blend
 --      formula from applyMigrationDirective)
--- Replicate DZ's getLeaderMigrationSettings (DZ_Leader.lua:1438).
--- Used by installLeaderFix for pressure-initiated migrations.
--- All referenced functions (GetMigrationSandboxSettings, IsMigrationEnabled)
--- are exposed on the DynamicZ table.
-local function getLeaderMigrationSettings(dz)
-    local Config = DynamicZ_Config or {}
-
-    local sandbox
-    if DynamicZ.GetMigrationSandboxSettings then
-        sandbox = DynamicZ.GetMigrationSandboxSettings()
-    else
-        sandbox = {
-            enabled = DynamicZ.IsMigrationEnabled and DynamicZ.IsMigrationEnabled() or false,
-            radius = 2, percentage = 30, killThreshold = 5,
-            killWindowHours = 24, cooldownHours = 12, durationHours = 8, intensity = 2,
-        }
-    end
-
-    local intensity = math.floor(clamp(toNumber(sandbox.intensity, 2), 1, 3))
-    local profile
-    if intensity <= 1 then
-        profile = { checkIntervalMult = 1.25, percentageMult = 0.85, minScoreBias = 1.0, cooldownMult = 1.15 }
-    elseif intensity >= 3 then
-        profile = { checkIntervalMult = 0.75, percentageMult = 1.15, minScoreBias = -1.0, cooldownMult = 0.85 }
-    else
-        profile = { checkIntervalMult = 1.0, percentageMult = 1.0, minScoreBias = 0.0, cooldownMult = 1.0 }
-    end
-
-    local leaderStage = math.max(0, math.floor(toNumber(dz and dz.leaderStage, 0)))
-    local basePercentage = clamp(toNumber(sandbox.percentage, 30), 10, 40)
-    local stagePercentBonus = clamp(toNumber(Config.MigrationLeaderStagePercentBonus, 5), 0, 10)
-
-    local baseCooldown = clamp(toNumber(sandbox.cooldownHours, 12), 6, 24)
-    local cooldownReduction = clamp(toNumber(Config.MigrationLeaderStageCooldownReductionHours, 0.5), 0, 1)
-
-    return {
-        enabled = sandbox.enabled == true,
-        percentage = clamp((basePercentage + (leaderStage * stagePercentBonus)) * profile.percentageMult, 10, 40),
-        cooldownHours = math.max(toNumber(Config.MigrationMinCooldownHours, 4.0),
-            (baseCooldown - (leaderStage * cooldownReduction)) * profile.cooldownMult),
-        durationHours = clamp(toNumber(sandbox.durationHours, 8), 4, 12),
-        checkIntervalHours = math.max(0.5, toNumber(Config.MigrationCheckIntervalHours, 6.0) * profile.checkIntervalMult),
-        minimumScore = toNumber(Config.MigrationMinimumScore, 3.0) + profile.minScoreBias,
-        minWorldEvolution = clamp(toNumber(Config.MigrationMinWorldEvolution, 0.35), 0.0, 1.0),
-        minFollowers = math.max(1, math.floor(toNumber(Config.MigrationMinFollowers, 6))),
-    }
-end
-
 local function installLeaderFix()
     if not DynamicZ or not DynamicZ.ApplyLeaderInfluence then
         logInfo("WARN installLeaderFix: DynamicZ.ApplyLeaderInfluence not available.")
@@ -919,7 +711,6 @@ local function installLeaderFix()
 
         local Config = DynamicZ_Config or {}
         local nowH = getNowHours()
-        local Pressure = DZChatCommands_Pressure
 
         -- Resolve leader's target
         local leaderTarget = nil
@@ -953,22 +744,6 @@ local function installLeaderFix()
                 local mty = toNumber(dz.migrationTargetY, nil)
                 local mtz = math.floor(toNumber(dz.migrationTargetZ, leaderZ))
                 if mtx and mty then
-                    -- Pressure Case A: redirect to higher-pressure chunk if available
-                    if Pressure and Pressure.isInstalled and Pressure.isInstalled()
-                       and Pressure.findBestPressureTarget and Pressure.getMigrationScoreAtPos then
-                        local curScore = Pressure.getMigrationScoreAtPos(mtx, mty)
-                        local better = Pressure.findBestPressureTarget(leader, curScore)
-                        if better then
-                            mtx = better.x
-                            mty = better.y
-                            mtz = better.z
-                            dz.migrationTargetX = mtx
-                            dz.migrationTargetY = mty
-                            dz.migrationTargetZ = mtz
-                            dz.migrationTargetChunkKey = better.key
-                        end
-                    end
-
                     -- Replicate blend logic from applyMigrationDirective
                     local blendW = clamp(toNumber(Config.MigrationDirectionBlendWeight, 0.40), 0.0, 1.0)
                     local pathX, pathY = mtx, mty
@@ -983,35 +758,6 @@ local function installLeaderFix()
                         end
                     end
                     pathToLocation(leader, pathX, pathY, mtz)
-                end
-            end
-
-        end
-
-        -- Pressure Case B setup: if DZ did not start a migration, check whether
-        -- a pressure-driven migration should be initiated. Follower collection is
-        -- piggybacked onto the follower-path traversal below (single grid walk).
-        local pressureFollowers, pTarget, pSettings
-        if dz.isMigrating ~= true
-           and Pressure and Pressure.isInstalled and Pressure.isInstalled()
-           and Pressure.findBestPressureTarget then
-            local settings = getLeaderMigrationSettings(dz)
-            if settings.enabled == true then
-                local worldEvo = toNumber(DynamicZ.Global and DynamicZ.Global.worldEvolution, 0.0)
-                if worldEvo >= settings.minWorldEvolution
-                   and math.max(0, math.floor(toNumber(dz.leaderStage, 0))) >= 1
-                   and math.max(0, math.floor(toNumber(dz.lastFollowerCount, 0))) >= settings.minFollowers
-                   and toNumber(dz.migrationCooldownUntil, 0.0) <= nowH then
-                    local nextCheck = toNumber(dz._pressureMigCheckHour, 0.0)
-                    if nextCheck <= nowH then
-                        dz._pressureMigCheckHour = nowH + settings.checkIntervalHours
-                        local pt = Pressure.findBestPressureTarget(leader, settings.minimumScore)
-                        if pt then
-                            pTarget = pt
-                            pSettings = settings
-                            pressureFollowers = {}
-                        end
-                    end
                 end
             end
         end
@@ -1040,18 +786,6 @@ local function installLeaderFix()
                             for i = 0, movObjs:size() - 1 do
                                 local obj = movObjs:get(i)
                                 if obj and obj ~= leader and instanceof and instanceof(obj, "IsoZombie") then
-                                    -- Piggyback: collect non-leader zombies for pressure migration (Case B)
-                                    if pressureFollowers then
-                                        if not DynamicZ.CanProcessZombie or DynamicZ.CanProcessZombie(obj) then
-                                            local pDZ = DynamicZ.EnsureZombieData and DynamicZ.EnsureZombieData(obj)
-                                            if pDZ and pDZ.isLeader ~= true then
-                                                local fdx = toNumber(obj:getX(), 0) - cx
-                                                local fdy = toNumber(obj:getY(), 0) - cy
-                                                pressureFollowers[#pressureFollowers + 1] = { zombie = obj, dz = pDZ, distSq = fdx*fdx + fdy*fdy }
-                                            end
-                                        end
-                                    end
-
                                     local fMD = obj.getModData and obj:getModData()
                                     local fDZ = fMD and fMD.DZ
                                     if fDZ and fDZ.leaderInfluence == true
@@ -1125,50 +859,6 @@ local function installLeaderFix()
                 end
             end
         end
-
-        -- Pressure Case B: assign migration ModData if enough followers collected
-        if pressureFollowers and pTarget and pSettings
-           and #pressureFollowers >= pSettings.minFollowers then
-            table.sort(pressureFollowers, function(a, b) return toNumber(a.distSq, 0) > toNumber(b.distSq, 0) end)
-            local migrateCount = math.max(1, math.floor(#pressureFollowers * (pSettings.percentage / 100.0)))
-            migrateCount = math.min(migrateCount, #pressureFollowers)
-            local leaderId = DynamicZ.GetZombieDebugId and tostring(DynamicZ.GetZombieDebugId(leader)) or "unknown"
-            local migEndTime = nowH + pSettings.durationHours
-
-            dz.isMigrating = true
-            dz.migrationRole = "leader"
-            dz.migrationLeaderId = leaderId
-            dz.migrationTargetX = pTarget.x
-            dz.migrationTargetY = pTarget.y
-            dz.migrationTargetZ = pTarget.z
-            dz.migrationTargetChunkKey = pTarget.key
-            dz.migrationEndTime = migEndTime
-            dz.migrationStartFollowers = #pressureFollowers
-            dz.migrationAssignedCount = migrateCount
-            dz.migrationStartHour = nowH
-            dz.migrationLastFollowerCount = #pressureFollowers
-            dz.migrationLastDirectiveHour = nil
-
-            for mi = 1, migrateCount do
-                local sel = pressureFollowers[mi]
-                if sel and sel.dz then
-                    sel.dz.isMigrating = true
-                    sel.dz.migrationRole = "follower"
-                    sel.dz.migrationLeaderId = leaderId
-                    sel.dz.migrationTargetX = pTarget.x
-                    sel.dz.migrationTargetY = pTarget.y
-                    sel.dz.migrationTargetZ = pTarget.z
-                    sel.dz.migrationTargetChunkKey = pTarget.key
-                    sel.dz.migrationEndTime = migEndTime
-                    sel.dz.migrationLastDirectiveHour = nil
-                end
-            end
-
-            logInfo(string.format(
-                "Pressure migration started: target=%s score=%.2f pressure=%.3f followers=%d/%d",
-                tostring(pTarget.key), toNumber(pTarget.score, 0),
-                toNumber(pTarget.pressure, 0), migrateCount, #pressureFollowers))
-        end
     end
 
     DynamicZ._DZChatCmds_LeaderFixed = true
@@ -1176,155 +866,8 @@ local function installLeaderFix()
     return true
 end
 
--- Replace DynamicZ.RecalculateWorldEvolution with a version that uses
--- our corrected getWorldAgeDays() (includes timeSinceApo offset).
--- DZ's original uses the local getWorldAgeDaysSafe() whose fallback path
--- (getWorldAgeHours()/24) misses the timeSinceApo sandbox offset.
--- Since getWorldAgeDaysSafe is local, we can't patch it directly.
--- Instead we replace the entire RecalculateWorldEvolution function.
--- This also means every zombie kill (DZ_Core.lua:255) now uses the
--- correct world age instead of potentially falling back to the wrong one.
-local function installRecalcFix()
-    if not DynamicZ or not DynamicZ.RecalculateWorldEvolution then
-        logInfo("WARN installRecalcFix: DynamicZ.RecalculateWorldEvolution not available.")
-        return false
-    end
-    if DynamicZ._DZChatCmds_RecalcFixed then
-        logInfo("RecalculateWorldEvolution fix already installed.")
-        return true
-    end
 
-    DynamicZ.RecalculateWorldEvolution = function()
-        if DynamicZ.IsEvolutionEnabled and not DynamicZ.IsEvolutionEnabled() then
-            return
-        end
 
-        local Config = DynamicZ_Config or {}
-        local days = getWorldAgeDays()
-        local timeFactor = toNumber(Config.TimeFactor, 0.005)
-        local killFactor = toNumber(Config.KillFactor, 0.0005)
-        local maxWorldEvolution = toNumber(Config.MaxWorldEvolution, 1.0)
-        local totalKills = toNumber(DynamicZ.Global.totalKills, 0)
-
-        local evolution = (days * timeFactor) + (totalKills * killFactor)
-        DynamicZ.Global.worldEvolution = clamp(evolution, 0.0, maxWorldEvolution)
-
-        DynamicZ.SaveGlobalState()
-    end
-
-    DynamicZ._DZChatCmds_RecalcFixed = true
-    logInfo("RecalculateWorldEvolution fix installed: uses corrected getWorldAgeDays with timeSinceApo.")
-    return true
-end
-
--- Replace DynamicZ.AdvanceLeaderTick with a version that uses a fallback
--- pulse interval of 3 instead of 180 (fix 13).
---
--- DZ_Leader.lua's AdvanceLeaderTick increments updateTick each call and
--- fires a leader pulse when (updateTick % interval == 0). The interval
--- comes from Config.LeaderPulseInterval with a hardcoded fallback of 180.
--- Since LeaderPulseInterval is not in DZ's default sandbox config, the
--- fallback always applies: a pulse fires every 180 ticks. Our companion
--- mod calls AdvanceLeaderTick once per real second (OnTick at 10 FPS,
--- ticks%10==0), so 180 ticks = 180 seconds = 3 minutes between pulses.
--- Leaders only act (TryLeaderPulse) when a pulse fires, making the
--- leader system extremely sluggish.
--- With fallback=3, pulses fire every 3 seconds, making leaders responsive.
-local function installTickFix()
-    if not DynamicZ then
-        logInfo("WARN installTickFix: DynamicZ table not available.")
-        return false
-    end
-    if DynamicZ._DZChatCmds_TickFixed then
-        logInfo("AdvanceLeaderTick fix already installed.")
-        return true
-    end
-
-    DynamicZ.AdvanceLeaderTick = function()
-        local runtime = DynamicZ.Runtime
-        runtime.updateTick = toNumber(runtime.updateTick, 0) + 1
-
-        local interval = toNumber((DynamicZ_Config or {}).LeaderPulseInterval, 3)
-        if interval < 1 then
-            interval = 1
-        end
-
-        if runtime.updateTick % interval == 0 then
-            runtime.pulseId = toNumber(runtime.pulseId, 0) + 1
-        end
-    end
-
-    DynamicZ._DZChatCmds_TickFixed = true
-    logInfo("AdvanceLeaderTick fix installed: fallback pulse interval 180 -> 3.")
-    return true
-end
-
--- Set DynamicZ.GetZombieDebugId to a function that returns a stable
--- identifier for debug logging (fix 14).
---
--- DZ_Leader.lua's local getZombieDebugId checks DynamicZ.GetZombieDebugId
--- first (line 44), then falls back to a position-based string "P:x:y:z".
--- By default GetZombieDebugId is nil, so every zombie is identified by
--- position, which is ambiguous when multiple zombies share a tile.
---
--- This fix provides a proper implementation:
--- 1. getOnlineID() — multiplayer network ID (works in MP, returns "O<id>")
--- 2. getID() — IsoMovingObject.id monotonic counter (works in SP,
---    returns "R<id>" for "Runtime")
--- 3. Position fallback "P:x:y:z" as last resort
---
--- Note: getZombieRuntimeId (local in DZ_Leader.lua, line 159) also tries
--- getOnlineID then getObjectID (which does NOT exist on IsoZombie) then
--- falls back to getZombieDebugId. By providing GetZombieDebugId with
--- getID(), we give getZombieRuntimeId a valid fallback instead of position.
-local function installDebugIdFix()
-    if not DynamicZ then
-        logInfo("WARN installDebugIdFix: DynamicZ table not available.")
-        return false
-    end
-    if DynamicZ._DZChatCmds_DebugIdFixed then
-        logInfo("GetZombieDebugId fix already installed.")
-        return true
-    end
-
-    DynamicZ.GetZombieDebugId = function(zombie)
-        if not zombie then
-            return "unknown"
-        end
-
-        -- Try getOnlineID first (multiplayer network ID)
-        if zombie.getOnlineID then
-            local ok, value = pcall(function() return zombie:getOnlineID() end)
-            if ok then
-                local n = tonumber(value)
-                if n ~= nil and n >= 0 then
-                    return "O" .. tostring(math.floor(n))
-                end
-            end
-        end
-
-        -- Try getID (IsoMovingObject.id — monotonic counter, works in SP+MP)
-        if zombie.getID then
-            local ok, value = pcall(function() return zombie:getID() end)
-            if ok then
-                local n = tonumber(value)
-                if n ~= nil and n >= 0 then
-                    return "R" .. tostring(math.floor(n))
-                end
-            end
-        end
-
-        -- Position fallback
-        local x = zombie.getX and math.floor(tonumber(zombie:getX()) or 0) or 0
-        local y = zombie.getY and math.floor(tonumber(zombie:getY()) or 0) or 0
-        local z = zombie.getZ and math.floor(tonumber(zombie:getZ()) or 0) or 0
-        return string.format("P:%d:%d:%d", x, y, z)
-    end
-
-    DynamicZ._DZChatCmds_DebugIdFixed = true
-    logInfo("GetZombieDebugId fix installed: uses getOnlineID -> getID -> position fallback.")
-    return true
-end
 
 -- Core fixup: restore from backup if ModData was empty,
 -- then compute correct worldEvolution using actual world age.
@@ -1347,35 +890,16 @@ local function onGameStartFixup()
     logInfo(string.format("Post-load state: totalKills=%d worldEvolution=%.4f",
         loadedKills, loadedEvo))
 
-    -- Log sandbox evolution setting
-    local evoEnabled = "unknown"
-    if DynamicZ.IsEvolutionEnabled then
-        evoEnabled = tostring(DynamicZ.IsEvolutionEnabled())
-    else
-        evoEnabled = "function not found"
-    end
-    logInfo("IsEvolutionEnabled = " .. evoEnabled)
-
-    -- Log world age (using our corrected method)
-    local days = getWorldAgeDays()
-    logInfo(string.format("World age (corrected): %.1f days", days))
-
     -- Sync totalKills from vanilla kill counters (the source of truth).
     -- This handles both fresh starts and restarts where ModData was lost.
     syncVanillaKills()
     logInfo(string.format("After vanilla sync: totalKills=%d", math.floor(toNumber(g.totalKills, 0))))
 
-    -- DZ's RecalculateWorldEvolution has a bug: it calls
-    -- gameTime:getWorldAgeDays() which doesn't exist on GameTime
-    -- (it's on IsoWorld). So it always computes days=0.
-    -- We ALWAYS compute worldEvolution ourselves using the correct method.
-    local computedEvo = computeWorldEvolution(g.totalKills)
-    if computedEvo > loadedEvo then
-        g.worldEvolution = computedEvo
-        logInfo(string.format("Set worldEvolution=%.4f (was %.4f)", computedEvo, loadedEvo))
-    else
-        logInfo(string.format("Keeping worldEvolution=%.4f (computed=%.4f)",
-            loadedEvo, computedEvo))
+    -- Recalculate worldEvolution using DZ's own (now-correct) formula.
+    -- DZ update fixed getWorldAgeDaysSafe to use getWorldAgeDaysSinceBegin.
+    if DynamicZ.RecalculateWorldEvolution then
+        DynamicZ.RecalculateWorldEvolution()
+        logInfo(string.format("After recalc: worldEvolution=%.4f", toNumber(g.worldEvolution, 0.0)))
     end
 
     -- Save: write to both ModData and our backup file.
@@ -1449,22 +973,18 @@ local function installAdminDebugAccess()
     return true
 end
 
--- Install all behavior fixes (search, sense, wander, leader, recalc, tick, debugId, killSync).
+-- Install all behavior fixes.
 -- Called from multiple init paths (OnGameStart, EveryOneMinute, ensureFixup).
+-- NOTE: Fixes 2,3,5,6,7,12,13,14,15 removed — now fixed natively in DZ update.
+-- Remaining active fixes: 1 (backup), 4 (OnGameStart fallback), 8-9 (search/sense),
+-- 10 (wander), 11 (leader follower), 16 (kill sync), admin debug access.
 local function installAllFixes()
     installSaveHook()
     installKillSyncFix()
     installSearchFix()
     installWanderFix()
     installLeaderFix()
-    installRecalcFix()
-    installTickFix()
-    installDebugIdFix()
     installAdminDebugAccess()
-    -- Activity pressure system: installs evo + seed hooks. Migration is handled by installLeaderFix above.
-    if DZChatCommands_Pressure and DZChatCommands_Pressure.install then
-        DZChatCommands_Pressure.install()
-    end
 end
 
 -- Lazy-init: run fixup on first client command if events never fired
@@ -1537,11 +1057,6 @@ local function onClientCommand(module, command, player, args)
             logInfo("ForceSave: writeBackup returned false.")
         end
 
-        -- Also persist pressure data
-        if DZChatCommands_Pressure and DZChatCommands_Pressure.writePressureFile then
-            DZChatCommands_Pressure.writePressureFile()
-        end
-
         -- Send confirmation back
         if sendServerCommand then
             local g = DynamicZ and DynamicZ.Global or {}
@@ -1559,35 +1074,6 @@ local function onClientCommand(module, command, player, args)
             logInfo("WARN ForceSave: sendServerCommand not available.")
         end
 
-    elseif command == "Pressure" then
-        logInfo("Pressure command received.")
-        if not player then return end
-        local isAdmin = false
-        if player.getAccessLevel then
-            local access = string.lower(tostring(player:getAccessLevel() or ""))
-            isAdmin = (access == "admin") or (access == "moderator")
-                   or (access == "overseer") or (access == "gm")
-        end
-        if not isAdmin then
-            if sendServerCommand then
-                pcall(function()
-                    sendServerCommand(player, "DynamicZ", "DebugInfo",
-                        { message = "Pressure denied: insufficient access." })
-                end)
-            end
-            return
-        end
-        if DZChatCommands_Pressure and DZChatCommands_Pressure.handleCommand then
-            DZChatCommands_Pressure.handleCommand(player)
-        else
-            if sendServerCommand then
-                pcall(function()
-                    sendServerCommand(player, "DynamicZ", "DebugInfo",
-                        { message = "Pressure system not loaded." })
-                end)
-            end
-        end
-
     elseif command == "Diagnostics" then
         logInfo("Diagnostics command received.")
         if not player then return end
@@ -1603,12 +1089,6 @@ local function onClientCommand(module, command, player, args)
             tostring(DynamicZ and DynamicZ._DZChatCmds_WanderFixed or false))
         lines[#lines + 1] = string.format("LeaderFixed: %s",
             tostring(DynamicZ and DynamicZ._DZChatCmds_LeaderFixed or false))
-        lines[#lines + 1] = string.format("RecalcFixed: %s",
-            tostring(DynamicZ and DynamicZ._DZChatCmds_RecalcFixed or false))
-        lines[#lines + 1] = string.format("TickFixed: %s",
-            tostring(DynamicZ and DynamicZ._DZChatCmds_TickFixed or false))
-        lines[#lines + 1] = string.format("DebugIdFixed: %s",
-            tostring(DynamicZ and DynamicZ._DZChatCmds_DebugIdFixed or false))
         lines[#lines + 1] = string.format("KillSyncFixed: %s",
             tostring(DynamicZ and DynamicZ._DZChatCmds_KillSyncFixed or false))
         lines[#lines + 1] = string.format("DynamicZ loaded: %s",
@@ -1632,35 +1112,6 @@ local function onClientCommand(module, command, player, args)
         end
         lines[#lines + 1] = "IsEvolutionEnabled: " .. evoEnabled
 
-        local days = getWorldAgeDays()
-        lines[#lines + 1] = string.format("World age (corrected): %.1f days", days)
-
-        -- Also log which method we used
-        local method = "none"
-        if getGameTime then
-            local gt = getGameTime()
-            if gt then
-                if gt.getWorldAgeDaysSinceBegin then
-                    method = "getWorldAgeDaysSinceBegin"
-                elseif gt.getWorldAgeHours then
-                    method = "getWorldAgeHours/24"
-                elseif gt.getNightsSurvived then
-                    method = "getNightsSurvived"
-                end
-            end
-        end
-        if method == "none" and getWorld then
-            local w = getWorld()
-            if w and w.getWorldAgeDays then
-                method = "getWorld():getWorldAgeDays"
-            end
-        end
-        lines[#lines + 1] = "World age method: " .. method
-
-        local computedEvo = computeWorldEvolution(
-            DynamicZ and DynamicZ.Global and DynamicZ.Global.totalKills or 0)
-        lines[#lines + 1] = string.format("Computed evo (formula): %.4f", computedEvo)
-
         -- Check backup file
         local backup = readBackup()
         if backup then
@@ -1668,16 +1119,6 @@ local function onClientCommand(module, command, player, args)
                 toNumber(backup.totalKills, 0), toNumber(backup.worldEvolution, 0))
         else
             lines[#lines + 1] = "Backup file: not found"
-        end
-
-        -- Activity pressure
-        if DZChatCommands_Pressure and DZChatCommands_Pressure.isInstalled and DZChatCommands_Pressure.isInstalled() then
-            lines[#lines + 1] = string.format("Pressure: max=%.3f avg=%.3f chunks=%d",
-                DZChatCommands_Pressure.getMaxPressure(),
-                DZChatCommands_Pressure.getAveragePressure(),
-                DZChatCommands_Pressure.getPressuredChunkCount())
-        else
-            lines[#lines + 1] = "Pressure: not installed"
         end
 
         -- Per-player kill tracking
@@ -1736,79 +1177,26 @@ if not DynamicZ_ChatCmds_ServerLoaded then
         end
     end)
 
-    -- Fallback: EveryOneMinute checks if fixup was missed + slow-cadence periodic tasks.
+    -- Fallback: EveryOneMinute checks if fixup was missed (fix 4).
+    -- DZ's EveryOneMinute now handles SyncVanillaKillCounter (our override),
+    -- TryAutoSeedLeaders, RecountActiveLeaders, and TickPressureSystem natively.
+    -- We only need the init fallback here.
     registerEvent("EveryOneMinute", function()
+        if fixupComplete then return end
         if not DynamicZ or not DynamicZ.Global then return end
-
-        if not fixupComplete then
-            if DynamicZ.Global.totalKills == nil then return end
-            logInfo("EveryOneMinute fallback: OnGameStart may not have fired, running fixup now.")
-            installAllFixes()
-            syncVanillaKills()
-            if onGameStartFixup() then
-                fixupComplete = true
-            end
-            return
-        end
-
-        -- Per-player kill sync: catches kills the event path may have missed
-        -- (e.g., vehicle kills). Once per minute is sufficient.
+        if DynamicZ.Global.totalKills == nil then return end
+        logInfo("EveryOneMinute fallback: OnGameStart may not have fired, running fixup now.")
+        installAllFixes()
         syncVanillaKills()
-        if DynamicZ.TryAutoSeedLeaders then
-            DynamicZ.TryAutoSeedLeaders()
-        end
-        if DynamicZ.RecountActiveLeaders then
-            DynamicZ.RecountActiveLeaders(false)
-        end
-        -- Activity pressure tick: accumulate/decay per-chunk pressure
-        if DZChatCommands_Pressure and DZChatCommands_Pressure.tick then
-            DZChatCommands_Pressure.tick()
+        if onGameStartFixup() then
+            fixupComplete = true
         end
     end)
 
-    -- OnTick: substitute for DZ's broken EveryOneSecond registration.
-    -- DZ registers AdvanceLeaderTick on the non-existent "EveryOneSecond" event,
-    -- so pulseId stays 0 forever and TryLeaderPulse always early-returns.
-    -- OnTick fires every frame with a monotonic tick counter as argument.
-    -- Dedicated server runs at 10 FPS (GameServer.java:816 sets lockFps=10),
-    -- so ticks % 10 == 0 fires AdvanceLeaderTick once per real second.
-    registerEvent("OnTick", function(ticks)
-        if not fixupComplete then return end
-        if not DynamicZ or not DynamicZ.AdvanceLeaderTick then return end
-        if ticks % 10 ~= 0 then return end
-
-        DynamicZ.AdvanceLeaderTick()
-
-        -- Fix 15: DebugTrackTick registered on non-existent "EveryOneSecond"
-        -- (DZ_Debug.lua:1501). Admin zombie tracking never ticks without this.
-        -- DebugTrackTick self-throttles via getNowHours/nextTickHour internally.
-        if DynamicZ.DebugTrackTick then
-            DynamicZ.DebugTrackTick()
-        end
-    end)
-
-    -- EveryDays: substitute for DZ's broken OnMidnight registration.
-    -- DZ registers RecalculateWorldEvolution on "OnMidnight" which does not
-    -- exist in PZ. EveryDays fires at in-game day rollover (GameTime.java:671
-    -- triggers when getTimeOfDay() >= 24.0). RecalculateWorldEvolution is cheap
-    -- arithmetic but calls ModData.transmit(), so once per day is appropriate.
-    -- We also recompute using our corrected world age formula, since DZ's own
-    -- RecalculateWorldEvolution uses the broken getWorldAgeDays on GameTime.
-    registerEvent("EveryDays", function()
-        if not fixupComplete then return end
-        if not DynamicZ or not DynamicZ.Global then return end
-
-        local g = DynamicZ.Global
-        local computedEvo = computeWorldEvolution(g.totalKills)
-        local currentEvo = toNumber(g.worldEvolution, 0.0)
-        if computedEvo > currentEvo then
-            g.worldEvolution = computedEvo
-            logInfo(string.format("EveryDays: worldEvolution %.4f -> %.4f", currentEvo, computedEvo))
-        end
-        if DynamicZ.SaveGlobalState then
-            DynamicZ.SaveGlobalState()
-        end
-    end)
+    -- NOTE: OnTick and EveryDays handlers removed — DZ update handles these natively.
+    -- DZ_Core.lua now simulates EveryOneSecond via OnTick (calling AdvanceLeaderTick
+    -- + DebugTrackTick), and EveryDays calls OnMidnight → RecalculateWorldEvolution.
+    -- Our SaveGlobalState hook ensures backups are written when DZ saves.
 
     registerEvent("OnClientCommand", onClientCommand)
     DynamicZ_ChatCmds_ServerLoaded = true
