@@ -321,16 +321,14 @@ local function writeBackup()
     local kills = math.floor(toNumber(g.totalKills, 0))
     local evo = toNumber(g.worldEvolution, 0.0)
     local leaders = math.floor(toNumber(g.activeLeaders, 0))
-    local pressure = toNumber(g.activityPressure, 0.0)
 
     writer:write("totalKills=" .. tostring(kills) .. "\n")
     writer:write("worldEvolution=" .. tostring(evo) .. "\n")
     writer:write("activeLeaders=" .. tostring(leaders) .. "\n")
-    writer:write("activityPressure=" .. tostring(pressure) .. "\n")
     writer:close()
 
-    logInfo(string.format("Backup written: kills=%d evo=%.4f leaders=%d pressure=%.4f",
-        kills, evo, leaders, pressure))
+    logInfo(string.format("Backup written: kills=%d evo=%.4f leaders=%d",
+        kills, evo, leaders))
     return true
 end
 
@@ -709,6 +707,28 @@ end
 --      offset by Config.LeaderSplitFlankDistance in 3 directions)
 --    - Migrating followers: blended migration target (replicating DZ's blend
 --      formula from applyMigrationDirective)
+-- 3. Deduplication: floor-based tile comparison via fDZ._cmdLastPathX/Y/Z
+--    skips redundant pathToLocationF when the computed target tile is unchanged.
+--    Effective for stationary followers and non-migrating with stable targets.
+--    Migration followers see limited benefit (blend shifts with follower position).
+
+-- Check if target tile changed from last pathed tile. Returns true if path needed.
+-- Stores new target in fDZ cache fields if changed.
+local function needsNewPath(fDZ, px, py, pz)
+    local tileX = math.floor(px)
+    local tileY = math.floor(py)
+    local tileZ = pz  -- already integer from math.floor upstream
+    if fDZ._cmdLastPathX == tileX
+       and fDZ._cmdLastPathY == tileY
+       and fDZ._cmdLastPathZ == tileZ then
+        return false
+    end
+    fDZ._cmdLastPathX = tileX
+    fDZ._cmdLastPathY = tileY
+    fDZ._cmdLastPathZ = tileZ
+    return true
+end
+
 local function installLeaderFix()
     if not DynamicZ or not DynamicZ.ApplyLeaderInfluence then
         logInfo("WARN installLeaderFix: DynamicZ.ApplyLeaderInfluence not available.")
@@ -867,7 +887,10 @@ local function installLeaderFix()
                                         end
 
                                         if px and py then
-                                            pathToLocation(obj, px, py, pz or leaderZ)
+                                            local finalZ = pz or leaderZ
+                                            if needsNewPath(fDZ, px, py, finalZ) then
+                                                pathToLocation(obj, px, py, finalZ)
+                                            end
                                         end
                                     end
                                 end

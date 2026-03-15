@@ -142,11 +142,6 @@ commands.diag = function(args)
     end
 end
 
-commands.pressure = function(args)
-    showInfo("Pressure system is now native to DZ (DZ_Pressure.lua).")
-    showInfo("Use DZ's built-in pressure diagnostics instead.")
-end
-
 -- Listen for DynamicZ server responses and show them in chat
 local NET_MODULE = "DynamicZ"
 local NET_INFO = "DebugInfo"
