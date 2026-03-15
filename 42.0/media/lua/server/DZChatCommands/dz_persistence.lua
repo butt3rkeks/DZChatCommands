@@ -122,7 +122,15 @@ local _logLastMessage = nil
 local _logLastMs = 0
 local _LOG_DEDUP_MS = 60000
 
+local function isDebugEnabled()
+    if SandboxVars and SandboxVars.DynamicZ then
+        return SandboxVars.DynamicZ.EnableDebugMode == true
+    end
+    return false
+end
+
 local function logInfo(message)
+    if not isDebugEnabled() then return end
     local msg = tostring(message)
     local nowMs = getTimestampMs and getTimestampMs() or 0
     if msg == _logLastMessage and (nowMs - _logLastMs) < _LOG_DEDUP_MS then

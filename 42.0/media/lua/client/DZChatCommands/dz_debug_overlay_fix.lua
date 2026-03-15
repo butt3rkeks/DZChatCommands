@@ -62,9 +62,15 @@ end
 -- Fix 2: Override DebugOverlay config so canShowOverlay() / drawOverlay() are
 -- not blocked. The admin + debugEnabled checks in canUseDebugUI() are sufficient.
 -- We set this unconditionally; canShowOverlay still requires debug enabled + admin.
+local function isDebugEnabled()
+    if SandboxVars and SandboxVars.DynamicZ then
+        return SandboxVars.DynamicZ.EnableDebugMode == true
+    end
+    return false
+end
+
 if DynamicZ_Config then
     DynamicZ_Config.DebugOverlay = true
-    print("[DZChatCommands] Debug overlay fix: set DynamicZ_Config.DebugOverlay = true")
 end
 
 local function tickUpdateNearestZombieCache()
@@ -115,7 +121,6 @@ local function tickUpdateNearestZombieCache()
         initialStatusSent = true
         if sendClientCommand then
             sendClientCommand("DynamicZ", "Debug", { action = "status" })
-            print("[DZChatCommands] Debug overlay fix: sent initial status request to server")
         end
     end
 
@@ -248,5 +253,4 @@ end
 -- Register on OnTick (verified: LuaEventManager.java line 590)
 if Events and Events.OnTick and Events.OnTick.Add then
     Events.OnTick.Add(tickUpdateNearestZombieCache)
-    print("[DZChatCommands] Debug overlay fix: registered updateNearestZombieCache on OnTick (throttled to ~1s via getTimestampMs)")
 end

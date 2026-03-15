@@ -234,4 +234,3 @@ ISChat["onCommandEntered"] = function(self)
     original_onCommandEntered(self)
 end
 
-print("[DZChatCommands] Chat hook installed - type /dz help in chat")
