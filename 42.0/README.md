@@ -1,10 +1,10 @@
 # Dynamic Evolution Z - MP Fixes
 
-Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes 9 bugs that break DZ on dedicated servers and provides admin chat commands for managing the evolution system.
+Companion mod for [Dynamic Evolution Z](https://steamcommunity.com/sharedfiles/filedetails/?id=3676814360). Fixes the one remaining bug that breaks DZ follower movement on dedicated servers, adds idle follower re-pathing, and provides admin chat commands.
 
 Does not modify any DZ files. All fixes are applied at runtime via function wrapping. Safe to add or remove at any time.
 
-> **DZ Update Note**: Fixes 2, 3, 5, 6, 7, 12, 13, 14, 15 were fixed upstream in the DZ restructuring update. The companion mod's pressure system was also removed — DZ now has a native `DZ_Pressure.lua` that is fully integrated into the evolution and leader systems.
+> **DZ Update Note**: DZ has natively fixed 17 of the original 18 bugs across multiple updates — including ambient wander (fix 10), cohesion drift (fix 17), and thump release (fix 18) which now use `tryPathToLocation` natively. The sole remaining fix is 11 (leader follower direction) where `applyFollowerBoost` still uses only dead `setLastHeardSound`. Kill data from the companion mod's previous per-player tracking file is automatically migrated into DZ's native file on first startup.
 
 ## Requirements
 
@@ -27,63 +27,66 @@ Type `/dz help` in-game chat. All commands require admin access.
 | `/dz makeleader [type]` | Promote nearest zombie to leader (HIVE/HUNTER/FRENZY/SHADOW/SPLIT) |
 | `/dz forcepulse` | Force all leaders to pulse immediately |
 | `/dz reset` | Reset all DZ state |
-| `/dz forcesave` | Force backup write to file |
-| `/dz diag` | Show server diagnostics (fix status, state values, backup info) |
+| `/dz forcesave` | Force save to ModData + DZ backup |
+| `/dz diag` | Show server diagnostics (fix status, state values) |
 
 ## Active Server-Side Fixes (dz_persistence.lua)
 
-### 1. ModData persistence loss
-DZ stores state in `ModData.getOrCreate("DynamicZ_Global")` which returns an empty table after dedicated server restart. Fix: wraps `SaveGlobalState` to also write a backup file via `getFileWriter`. On startup, restores from backup if ModData is empty.
+### 11. Dead setLastHeardSound in leader influence (ESSENTIAL)
+DZ's `ApplyLeaderInfluence` calls `applyFollowerBoost` (DZ_Leader:4998-5107) which uses `trySetLastHeardSound` for all 5 follower types: HUNTER (line 5044), FRENZY (lines 5055/5057), SHADOW (lines 5067/5072), SPLIT (line 5082), HIVE (line 5103). **Zero `tryPathToLocation` calls in this function.** This fix is the sole source of working follower pathing.
 
-### 4. OnGameStart unreliable on dedicated servers
-DZ uses `Events.OnGameStart.Add` which may not fire on dedicated servers. Fix: registers an `EveryOneMinute` fallback that runs fixup if `OnGameStart` was missed.
+New STALKER/HOWLER leader types are safe: `ApplyLeaderInfluence` returns early at DZ_Leader:5130-5140 for these types, delegating to dedicated `runStalkerLeader`/`runHowlerLeader` functions that use native `tryPathToLocation`. Neither sets `leaderInfluence=true` via `applyFollowerBoost`, so our grid traversal finds no influenced followers and takes no action.
 
-### 8. Dead setLastHeardSound in search-after-target-loss
-DZ's `applyPersistenceAndSearch` calls `setLastHeardSound(x,y,z)` when an evolved zombie loses sight of its target. The zombie should search the player's last known position, but `setLastHeardSound` is dead code in B42 — the `lastHeardSound` field is written but never read by any game system (14 references: 7 writes, 1 reset, 0 reads).
-
-Fix: wraps `ApplyStageEvolutionBuffs` to detect target loss and call `pathToLocationF` (A* pathfinding via `PathFindBehavior2`/`PolygonalMap2`, which works on dedicated servers). Enhanced with player ID tracking: stores the targeted player's `onlineID` while the zombie has a target, then uses `getPlayerByOnlineID` (O(1) HashMap lookup) after target loss to path toward the player's *current* position. Re-paths every 3 seconds for the duration of DZ's search window. Falls back to static last-known position if the player disconnected.
-
-### 9. Dead setLastHeardSound in stage 4+ sense
-DZ's `applyStage4Sense` calls dead `setLastHeardSound` when a stage 4+ zombie senses a nearby player without line of sight. The zombie should investigate but never moves. Fix: extends the `ApplyStageEvolutionBuffs` wrapper to replicate `findNearestPlayer` and call `pathToLocationF` to the detected player's position.
-
-### 10. Dead setLastHeardSound in ambient wander
-DZ's `TryAmbientWander` calls dead `setLastHeardSound` to make idle evolved zombies wander toward computed targets (influenced by nearby player presence and reactive kill signals). Fix: wraps `TryAmbientWander` to read stored target coords from modData and call `pathToLocationF`.
-
-### 11. Dead setLastHeardSound in leader influence
-DZ's `ApplyLeaderInfluence` calls dead `setLastHeardSound` to direct followers toward the leader's target, leader's position, or migration waypoints. Fix: wraps `ApplyLeaderInfluence` to iterate influenced followers and call `pathToLocationF` with coordinates per leader type:
-- **HUNTER/FRENZY/SHADOW/HIVE**: leader's target position or leader's own position
+Fix: wraps `ApplyLeaderInfluence` to iterate influenced followers via grid traversal and call `pathToLocationF` with coordinates per leader type:
+- **HUNTER/HIVE**: leader's target position
+- **FRENZY/SHADOW**: leader's target position, or leader's own position as fallback
 - **SPLIT**: 3-way flanking offset computed from follower position hash (replicates DZ's `computeSplitPoint` using `LeaderSplitFlankDistance`)
-- **Migrating**: blended migration target coordinates
+- **Migrating**: blended migration target (replicates DZ's blend formula from `applyMigrationDirective`)
 
-### 16. SyncVanillaKillCounter loses offline player kills
-DZ's `SyncVanillaKillCounter` only sums online players' kills — offline players' kills disappear from the sum. Fix: replaces `SyncVanillaKillCounter` with a vanilla-truth sync. Each player's `getZombieKills()` is the source of truth — PZ serializes this to the player save file, so it persists across restarts. Per-player values are persisted to `DZChatCommands_PlayerKills.ini` so offline players' kills are retained. `totalKills = max(totalKills, vanillaSum)` preserves unattributed kills (fire, environmental).
+Includes four layers of deduplication/protection:
+- **Path dedup**: floor-based tile comparison via `needsNewPath()` against cached `fDZ._cmdLastPathX/Y/Z` skips redundant `pathToLocationF` when the computed target tile is unchanged.
+- **FRENZY/SPLIT path preservation**: DZ's `applyFollowerBoost` calls `tryResetPath` on FRENZY (line 5059) and SPLIT (line 5093) followers, clearing their A* path (`path2=nil`). Since our replacement `pathToLocationF` is async, the zombie would stop dead until the new path arrives. Fix: saves `path2` references before calling the original, restores them after — the zombie keeps walking its old path until A* delivers the new one.
+- **Multi-leader dedup**: when two leaders have overlapping radii, both iterate the same followers. Without dedup, a farther leader could override the closer leader's path, causing twitching. Fix: per-pulse `{zombieId → distSq}` tracking ensures only the closest leader's direction takes effect, mirroring DZ's `canLeaderClaimFollowerForPulse` (DZ_Leader:2778-2803).
+- **Stutter prevention**: `pathToLocationF` always fires (keeping the A* target current), but animation variables (`bPathfind`/`bMoving`) are only set when the zombie is idle (`getPath2() == nil`). Walking zombies are already in PathFindState — `pathToLocationF` updates the target via `setData`, and `pfb2.update()` resubmits A* next frame while `updateWhileRunningPathfind` keeps the zombie moving.
 
-### 17. Dead setLastHeardSound in cohesion drift
-DZ's `TryCohesionDrift` computes a centroid of nearby eligible peers and calls dead `setLastHeardSound` to bias the zombie toward the group center. The drift target is ephemeral (local variables, never stored in modData). Fix: wraps `TryCohesionDrift`, detects when drift occurred via `cohesionLastDriftHour` change, re-derives the approximate centroid using grid traversal of nearby influenced/migrating zombies, and calls `pathToLocationF`.
+### Idle follower re-path via OnZombieUpdate
+The 3-second leader pulse paths followers to the player's position at pulse time. When the player moves, the zombie arrives at the stale position in 1-2s, completes its A* path, exits PathFindState, and goes idle waiting up to 3 seconds for the next pulse. Visible as stop-wait-repath stuttering at 5-7 tile distance.
 
-### 18. Dead setLastHeardSound in thump-release re-issue
-DZ's `reissueDirectiveAfterThumpRelease` (local function called from `TryReleaseStaleThumpTarget`) clears a stale thump target and re-issues the zombie's previous movement directive. Migration leaders correctly use `tryPathToLocation` (line 541), but migration followers (line 543) and ambient wander re-issue (line 557) use dead `setLastHeardSound`. Fix: wraps `TryReleaseStaleThumpTarget` and reads the stored coords from modData (`migrationTargetX/Y/Z` or `ambientLastTargetX/Y/Z`) to call `pathToLocationF`.
+Fix: registers `OnZombieUpdate` (fires per-frame per-zombie on the auth-owning client where DZ runs). Throttled to 300ms per zombie via `_cmdIdleCheckMs`. When an influenced follower has no active path (`path2 == nil`), immediately re-paths toward `zombie:getTarget()` — the player's CURRENT position. Includes a 2-tile proximity skip and clears the `needsNewPath` cache so the next pulse isn't deduped. Worst-case idle time drops from 3000ms to ~300ms.
+
+Works independently of DZ's `CoreBatchProcessingEnabled` (default: true). DZ's batch processing replaces DZ's own `OnZombieUpdate` handler, but PZ engine fires the `OnZombieUpdate` event per-frame per-zombie regardless. Our handler is registered independently.
 
 ### Admin debug access
-DZ's debug system requires the sandbox `EnableDebugMode` setting. Fix: sets `DynamicZ.DebugEnabled = true` server-side at startup, propagated to clients via `buildStatePayload`. The existing admin check in `canUseDebugUI` ensures only admins see the overlay.
+DZ's debug system requires the sandbox `EnableDebugMode` setting, and `DZ_Core` resets both `DebugEnabled` and `DebugEnabledOverride` during init. Fix: sets `DynamicZ.DebugEnabledOverride = true` — this is the highest priority in `IsDebugEnabled()`'s check chain (DZ_Debug.lua line 83-85) and survives DZ's init reset. The existing admin check in `canUseDebug` ensures only admins see the overlay.
+
+### Kill data migration
+On first startup after updating the companion mod, `migrateKillData()` reads `DZChatCommands_PlayerKills.ini` (the companion mod's previous per-player tracking file), merges any higher values into DZ's native `DynamicZ_PlayerKills.ini`, and triggers DZ's `SyncVanillaKillCounter` to update totals. This is a one-time operation — after migration, DZ's native kill tracking handles everything.
 
 ## Fixed Upstream (no longer in companion mod)
 
-These fixes were removed because the DZ update addressed them natively:
+These fixes were removed because DZ addressed them natively:
 
 | # | Bug | DZ Fix |
 |---|-----|--------|
+| 1 | ModData persistence loss on restart | `DZ_GlobalState` writes `DynamicZ_GlobalBackup.ini` natively |
 | 2 | worldEvolution never computed on startup | `RecalculateWorldEvolution()` called in `OnGameStart` |
 | 3 | getWorldAgeDays on wrong object | Uses `getWorldAgeDaysSinceBegin()` |
+| 4 | OnGameStart unreliable on dedicated servers | `ensureStartupStateAvailable()` fallback in `OnEveryOneMinute` |
 | 5 | EveryOneSecond doesn't exist | Simulated via `OnTick` with `getTimestampMs` / tick fallback |
 | 6 | OnMidnight doesn't exist | Called from `OnEveryDays()` |
 | 7 | getNumActiveZombies doesn't exist | `getNumActiveZombiesSafe()` with fallback |
-| 12 | getWorldAgeDaysSafe fallback drops TimeSinceApo | Primary path now uses `getWorldAgeDaysSinceBegin` (includes offset) |
+| 8 | Dead setLastHeardSound in search-after-target-loss | `TryPathToLocation` natively (DZ_Evolution:723) |
+| 9 | Dead setLastHeardSound in stage 4+ sense | `TryPathToLocation` natively (DZ_Evolution:810) |
+| 10 | Dead setLastHeardSound in ambient wander | `tryAmbientPathWithFallback` natively (DZ_Leader:1446) |
+| 12 | getWorldAgeDaysSafe fallback drops TimeSinceApo | Primary path now uses `getWorldAgeDaysSinceBegin` |
 | 13 | LeaderPulseInterval defaults to 180 | Config now sets `LeaderPulseInterval = 3` |
-| 14 | GetZombieDebugId is nil | `DZ_Debug` exports it with onlineID/objectID/position chain |
-| 15 | DebugTrackTick on non-existent EveryOneSecond | Called from `OnEveryOneSecond` via `OnTick` simulation |
+| 14 | GetZombieDebugId is nil | `DZ_Debug` exports it (DZ_Debug:281) |
+| 15 | DebugTrackTick on non-existent EveryOneSecond | Called from `OnTick` simulation |
+| 16 | SyncVanillaKillCounter loses offline player kills | Native per-player file tracking |
+| 17 | Dead setLastHeardSound in cohesion drift | `tryPathToLocation` + `tryPathToLocationFDirect` natively (DZ_Leader:3617-3619) with budget system |
+| 18 | Dead setLastHeardSound in thump-release | `tryPathToLocation` natively in `reissueDirectiveAfterThumpRelease` (DZ_Leader:2425-2496) |
 
-The companion mod's **Activity Pressure System** (`dz_pressure.lua`) was also removed — DZ now has a native `DZ_Pressure.lua` with full integration into evolution bonuses, leader seed multipliers, and migration scoring.
+The companion mod's **Activity Pressure System** (`dz_pressure.lua`) was also removed in an earlier update — DZ now has a native `DZ_Pressure.lua` with full integration into evolution bonuses, leader seed multipliers, and migration scoring.
 
 ## Client-Side Fixes
 
@@ -103,9 +106,9 @@ Server responses (`DebugInfo` and `DebugState`) are displayed in chat with dedup
 
 ## Known Limitations
 
-- **zombie.memory field**: PZ's Kahlua bridge only exposes Java methods, not instance fields. `IsoZombie.memory` (public int) is inaccessible from Lua. The memory buff in DZ's evolution system is effectively dead. The search fix (fix 8) provides a behavioral workaround via active pathfinding-based tracking instead of passive forget-time extension.
+- **zombie.memory field**: PZ's Kahlua bridge only exposes Java methods, not instance fields. `IsoZombie.memory` (public int) is inaccessible from Lua. The memory buff in DZ's evolution system is effectively dead.
 
-- **getZombieRuntimeId**: Uses `getObjectID()` which doesn't exist on `IsoZombie`. However, it tries `getOnlineID()` first which works in multiplayer, so this is not broken on dedicated servers.
+- **SPLIT dual bucket mismatch**: DZ has an internal inconsistency between `computeSplitPoint` (`(fx+fy*3)%3`) and `applyFollowerBoost` inline (`(fx+fy)%3`, line 5086). The companion mod replicates `computeSplitPoint` (the positioning function). This is a DZ-internal bug — the fix belongs upstream.
 
 ## Files
 
@@ -113,7 +116,7 @@ Server responses (`DebugInfo` and `DebugState`) are displayed in chat with dedup
 42.0/
   media/lua/
     server/DZChatCommands/
-      dz_persistence.lua     # 9 active server-side fixes + ForceSave/Diagnostics commands
+      dz_persistence.lua     # Fix 11 + idle repath + ForceSave/Diagnostics
     client/DZChatCommands/
       dz_chat.lua            # Chat command bridge (/dz <subcommand>)
       dz_debug_overlay_fix.lua  # Debug HUD overlay fixes
